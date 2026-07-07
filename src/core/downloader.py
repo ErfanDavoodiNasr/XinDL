@@ -25,12 +25,13 @@ def is_valid_url(url: str) -> bool:
         return False
 
 # Base predefined formats for safe execution
+# Relaxed formats to handle Instagram, TikTok properly instead of strictly forcing AVC
 BASE_VIDEO_FORMATS = [
-    {"id": "best", "label": "Highest Quality", "height": 9999, "fmt": "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"},
-    {"id": "4k", "label": "4K (2160p)", "height": 2160, "fmt": "bestvideo[height<=2160][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"},
-    {"id": "1080p", "label": "1080p (Full HD)", "height": 1080, "fmt": "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"},
-    {"id": "720p", "label": "720p (HD)", "height": 720, "fmt": "bestvideo[height<=720][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"},
-    {"id": "480p", "label": "480p (SD)", "height": 480, "fmt": "bestvideo[height<=480][vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"}
+    {"id": "best", "label": "Highest Quality", "height": 9999, "fmt": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"},
+    {"id": "4k", "label": "4K (2160p)", "height": 2160, "fmt": "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"},
+    {"id": "1080p", "label": "1080p (Full HD)", "height": 1080, "fmt": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"},
+    {"id": "720p", "label": "720p (HD)", "height": 720, "fmt": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"},
+    {"id": "480p", "label": "480p (SD)", "height": 480, "fmt": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best"}
 ]
 
 BASE_AUDIO_FORMATS = [
@@ -177,12 +178,16 @@ async def search_media(query: str, limit: int = 10) -> Optional[list]:
                 if 'entries' in info:
                     results = []
                     for entry in info['entries']:
+                        thumbnail = entry.get('thumbnail')
+                        if not thumbnail and entry.get('thumbnails'):
+                            thumbnail = entry['thumbnails'][0].get('url')
                         results.append({
                             'id': entry.get('id'),
                             'title': entry.get('title'),
                             'url': entry.get('url'),
                             'duration': entry.get('duration'),
-                            'uploader': entry.get('uploader')
+                            'uploader': entry.get('uploader'),
+                            'thumbnail': thumbnail
                         })
                     return results
                 return []

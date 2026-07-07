@@ -119,12 +119,15 @@ async def display_search_result(msg: Message, results: list, index: int):
     title = result.get('title', 'Unknown Title')
     uploader = result.get('uploader', 'Unknown')
     duration = result.get('duration', 0)
+    thumbnail = result.get('thumbnail')
     
     minutes, seconds = divmod(duration, 60)
     duration_str = f"{minutes}:{seconds:02d}"
     
+    thumb_html = f"<a href='{thumbnail}'>&#8205;</a>" if thumbnail else ""
+    
     text = (
-        f"🔎 <b>Search Result {index + 1}/{len(results)}</b>\n\n"
+        f"{thumb_html}🔎 <b>Search Result {index + 1}/{len(results)}</b>\n\n"
         f"🎥 <b>{title}</b>\n"
         f"👤 <i>{uploader}</i> | ⏱ <i>{duration_str}</i>"
     )
@@ -132,7 +135,8 @@ async def display_search_result(msg: Message, results: list, index: int):
     try:
         await msg.edit_text(
             text, 
-            reply_markup=search_results_keyboard(len(results), index, result.get('url'))
+            reply_markup=search_results_keyboard(len(results), index, result.get('url')),
+            disable_web_page_preview=False
         )
     except Exception as e:
         logger.error(f"Error editing message: {e}")
@@ -192,8 +196,6 @@ async def ignore_callback(callback: CallbackQuery):
 
 @router.callback_query(F.data == "cancel_dl")
 async def cancel_download(callback: CallbackQuery, state: FSMContext):
-    # Read custom cancel data if available in FSM or pass from cb
-    # Here we just use a generic cancel approach where we check if a download is active in the state
     data = await state.get_data()
     url = data.get("active_download_url")
     if url:
@@ -224,7 +226,6 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
         
-    # Mark the URL as the active download so the cancel button works
     await state.update_data(active_download_url=url)
     await state.set_state(DownloadState.downloading)
     
@@ -236,13 +237,14 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
         reply_markup=cancel_keyboard()
     )
     
-    # Spawn background task to free up the event loop
-    asyncio.create_task(_background_download_task(callback, url, format_id, is_audio, state))
+    loop = asyncio.get_running_loop()
+    asyncio.create_task(_background_download_task(callback, url, format_id, is_audio, state, loop))
     
     await callback.answer("Download started in background!", show_alert=False)
 
 
-async def _background_download_task(callback: CallbackQuery, url: str, format_id: str, is_audio: bool, state: FSMContext):
+async def _background_download_task(callback: CallbackQuery, url: str, format_id: str, is_audio: bool, state: FSMContext, loop: asyncio.AbstractEventLoop):
+    logger.info(f"Starting download for URL: {url} | Format: {format_id}")
     last_update_time = time.time()
     
     def progress_hook(d):
@@ -279,15 +281,13 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                         f"⏱ <b>ETA:</b> {eta}"
                     )
                     
-                    # Fire and forget edit message to avoid blocking hook
-                    asyncio.create_task(
-                        callback.message.edit_text(
-                            text,
-                            reply_markup=cancel_keyboard()
-                        )
+                    # Schedule update safely on the main event loop
+                    asyncio.run_coroutine_threadsafe(
+                        callback.message.edit_text(text, reply_markup=cancel_keyboard()),
+                        loop
                     )
                 except Exception as e:
-                    logger.warning(f"Error updating progress UI: {e}")
+                    logger.warning(f"Error scheduling progress UI update: {e}")
 
     try:
         success, result, title = await download_media(url, format_id=format_id, is_audio=is_audio, progress_callback=progress_hook)
@@ -295,6 +295,7 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         if str(e) == "DownloadCancelled":
             if url in cancelled_downloads:
                 cancelled_downloads.remove(url)
+            logger.info(f"Download cancelled by user: {url}")
             return
         success, result, title = False, str(e), ""
     
@@ -302,32 +303,48 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         cancelled_downloads.remove(url)
         if result and os.path.exists(result):
             os.remove(result)
+        logger.info(f"Download cancelled by user after completion: {url}")
         return
         
     await state.clear()
     
     if not success:
+        logger.error(f"Failed to download {url}: {result}")
         await callback.message.edit_text(
             f"❌ <b>Error downloading:</b> {result}",
             reply_markup=post_download_keyboard()
         )
         return
         
-    await callback.message.edit_text("📤 <b>Uploading to Telegram...</b>")
+    file_size_bytes = os.path.getsize(result) if os.path.exists(result) else 0
+    file_size_mb = file_size_bytes / (1024 * 1024)
+    logger.info(f"Download successful: {url} | File: {result} | Size: {file_size_mb:.2f} MB")
+        
+    await callback.message.edit_text(f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>")
     
     try:
-        from aiogram.types import FSInputFile
-        file = FSInputFile(result)
+        from src.core.config import settings
         
-        caption = f"🎥 <b>{title}</b>\n\n⚡️ <i>Downloaded via @XinDL</i>"
+        # Format the beautiful caption
+        caption = (
+            f"🎥 <b>{title}</b>\n\n"
+            f"📊 <b>Size:</b> {file_size_mb:.2f} MB\n"
+            f"⚙️ <b>Quality:</b> {format_id}\n\n"
+            f"⚡️ <i>Downloaded via @XinDL</i>"
+        )
+        
+        # Extremely fast local upload via file:// protocol (bypasses HTTP entirely)
+        # Using abspath ensures local API server finds it correctly inside the shared mount
+        local_uri = f"file://{os.path.abspath(result)}"
         
         if not is_audio:
             await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-            await callback.message.answer_video(video=file, caption=caption, request_timeout=300)
+            await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=30)
         else:
             await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-            await callback.message.answer_audio(audio=file, caption=caption, request_timeout=300)
+            await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=30)
             
+        logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
         await callback.message.delete()
         await callback.message.answer(
             "✅ <b>Download Complete!</b>\n\nWhat would you like to do next?", 
@@ -338,14 +355,15 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         logger.warning(f"Rate limited by Telegram. Retry after {e.retry_after}")
         await callback.message.edit_text(f"❌ Rate limited by Telegram. Please try again after {e.retry_after} seconds.")
     except TelegramNetworkError as e:
-        logger.error(f"Network error while uploading: {e}")
+        logger.error(f"Network error while uploading {result}: {e}")
         await callback.message.edit_text("❌ Network error while uploading to Telegram. The file might be too large.")
     except Exception as e:
-        logger.error(f"Error uploading to Telegram: {e}")
+        logger.error(f"Unexpected error uploading to Telegram {result}: {e}")
         await callback.message.edit_text("❌ An unexpected error occurred during upload.")
     finally:
         if os.path.exists(result):
             try:
                 os.remove(result)
+                logger.info(f"Cleaned up file: {result}")
             except Exception as e:
                 logger.error(f"Failed to remove file {result}: {e}")

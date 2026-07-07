@@ -19,12 +19,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg) and create non-root user
-RUN apk add --no-cache ffmpeg && \
+# Install runtime dependencies (ffmpeg, nodejs) and create non-root user
+RUN apk add --no-cache ffmpeg nodejs && \
     addgroup -S botgroup && \
     adduser -S botuser -G botgroup && \
     mkdir -p /app/data /app/downloads && \
     chown -R botuser:botgroup /app
+
 
 # Copy wheels and install
 COPY --from=builder /build/wheels /wheels
