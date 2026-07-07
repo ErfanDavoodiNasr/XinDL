@@ -17,7 +17,7 @@ import logging
 import asyncio
 import re
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.enums import ChatAction, ParseMode
+from aiogram.enums import ChatAction
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -54,35 +54,35 @@ def get_help_text() -> str:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(get_welcome_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    await message.answer(get_welcome_text(), reply_markup=main_menu_keyboard())
 
 @router.message(Command("help"))
 @router.message(F.text == "ℹ️ Help")
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(get_help_text(), parse_mode=ParseMode.HTML)
+    await message.answer(get_help_text())
 
 @router.callback_query(F.data == "help_menu")
 async def callback_help(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text(get_help_text(), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(get_help_text())
     
 @router.callback_query(F.data == "new_dl")
 async def callback_new_dl(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("👇 <i>Please send me the new link or search query.</i>", parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("👇 <i>Please send me the new link or search query.</i>")
 
 # Handle URLs
 @router.message(F.text.regexp(r'https?://[^\s]+'))
 async def handle_url(message: Message, state: FSMContext):
     url = message.text.strip()
     
-    msg = await message.reply("🔍 <i>Analyzing available qualities...</i>", parse_mode=ParseMode.HTML)
+    msg = await message.reply("🔍 <i>Analyzing available qualities...</i>")
     
     # We await fetch_info directly here because it is fast (uses to_thread + caching)
     info = await fetch_info(url)
     if not info:
-        await msg.edit_text("❌ <i>Could not extract information.</i> Please ensure it's a valid, public media link.", parse_mode=ParseMode.HTML)
+        await msg.edit_text("❌ <i>Could not extract information.</i> Please ensure it's a valid, public media link.")
         return
 
     title = info.get('title', 'Unknown Title')
@@ -92,7 +92,7 @@ async def handle_url(message: Message, state: FSMContext):
     await state.set_state(DownloadState.waiting_for_format)
     
     text = f"🎥 <b>{title}</b>\n\n👇 <i>Choose your preferred download quality:</i>"
-    await msg.edit_text(text, reply_markup=download_format_keyboard(formats), parse_mode=ParseMode.HTML)
+    await msg.edit_text(text, reply_markup=download_format_keyboard(formats))
 
 # Handle Search Text
 @router.message(F.text)
@@ -101,12 +101,12 @@ async def handle_search(message: Message, state: FSMContext):
     if query == "ℹ️ Help" or query.startswith("/"):
         return
         
-    msg = await message.reply(f"🔍 <i>Searching for '{query}'...</i>", parse_mode=ParseMode.HTML)
+    msg = await message.reply(f"🔍 <i>Searching for '{query}'...</i>")
     
     results = await search_media(query, limit=10)
     
     if not results:
-        await msg.edit_text("❌ <i>No results found.</i> Please try a different search term.", parse_mode=ParseMode.HTML)
+        await msg.edit_text("❌ <i>No results found.</i> Please try a different search term.")
         return
         
     await state.update_data(search_results=results, current_index=0, msg_id=msg.message_id)
@@ -132,8 +132,7 @@ async def display_search_result(msg: Message, results: list, index: int):
     try:
         await msg.edit_text(
             text, 
-            reply_markup=search_results_keyboard(len(results), index, result.get('url')), 
-            parse_mode=ParseMode.HTML
+            reply_markup=search_results_keyboard(len(results), index, result.get('url'))
         )
     except Exception as e:
         logger.error(f"Error editing message: {e}")
@@ -155,7 +154,7 @@ async def search_nav(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "cancel_search", DownloadState.searching)
 async def cancel_search(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("🛑 <b>Search Cancelled.</b>\n\nYou can send a new link or search query.", parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("🛑 <b>Search Cancelled.</b>\n\nYou can send a new link or search query.")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("search_dl_"), DownloadState.searching)
@@ -170,11 +169,11 @@ async def search_dl(callback: CallbackQuery, state: FSMContext):
         
     url = results[index].get('url')
     
-    await callback.message.edit_text("🔍 <i>Analyzing available qualities...</i>", parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("🔍 <i>Analyzing available qualities...</i>")
     
     info = await fetch_info(url)
     if not info:
-        await callback.message.edit_text("❌ <i>Could not extract information.</i>", parse_mode=ParseMode.HTML)
+        await callback.message.edit_text("❌ <i>Could not extract information.</i>")
         return
 
     title = info.get('title', 'Unknown Title')
@@ -184,7 +183,7 @@ async def search_dl(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DownloadState.waiting_for_format)
     
     text = f"🎥 <b>{title}</b>\n\n👇 <i>Choose your preferred download quality:</i>"
-    await callback.message.edit_text(text, reply_markup=download_format_keyboard(formats), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(text, reply_markup=download_format_keyboard(formats))
 
 
 @router.callback_query(F.data == "ignore")
@@ -201,7 +200,7 @@ async def cancel_download(callback: CallbackQuery, state: FSMContext):
         cancelled_downloads.add(url)
     
     await state.clear()
-    await callback.message.edit_text("🛑 <b>Download Cancelled.</b>\n\nYou can send a new link whenever you're ready.", parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("🛑 <b>Download Cancelled.</b>\n\nYou can send a new link whenever you're ready.")
     await callback.answer("Cancelled successfully.", show_alert=False)
 
 def build_progress_bar(percent: float) -> str:
@@ -233,8 +232,7 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
         cancelled_downloads.remove(url)
         
     await callback.message.edit_text(
-        "⏳ <b>Downloading... Please wait.</b>\n<i>(This may take a moment depending on file size)</i>", 
-        parse_mode=ParseMode.HTML,
+        "⏳ <b>Downloading... Please wait.</b>\n<i>(This may take a moment depending on file size)</i>",
         reply_markup=cancel_keyboard()
     )
     
@@ -285,8 +283,7 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                     asyncio.create_task(
                         callback.message.edit_text(
                             text,
-                            reply_markup=cancel_keyboard(),
-                            parse_mode=ParseMode.HTML
+                            reply_markup=cancel_keyboard()
                         )
                     )
                 except Exception as e:
@@ -311,13 +308,12 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
     
     if not success:
         await callback.message.edit_text(
-            f"❌ <b>Error downloading:</b> {result}", 
-            parse_mode=ParseMode.HTML,
+            f"❌ <b>Error downloading:</b> {result}",
             reply_markup=post_download_keyboard()
         )
         return
         
-    await callback.message.edit_text("📤 <b>Uploading to Telegram...</b>", parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("📤 <b>Uploading to Telegram...</b>")
     
     try:
         from aiogram.types import FSInputFile
@@ -327,15 +323,14 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         
         if not is_audio:
             await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-            await callback.message.answer_video(video=file, caption=caption, parse_mode=ParseMode.HTML, request_timeout=300)
+            await callback.message.answer_video(video=file, caption=caption, request_timeout=300)
         else:
             await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-            await callback.message.answer_audio(audio=file, caption=caption, parse_mode=ParseMode.HTML, request_timeout=300)
+            await callback.message.answer_audio(audio=file, caption=caption, request_timeout=300)
             
         await callback.message.delete()
         await callback.message.answer(
             "✅ <b>Download Complete!</b>\n\nWhat would you like to do next?", 
-            parse_mode=ParseMode.HTML, 
             reply_markup=post_download_keyboard()
         )
             

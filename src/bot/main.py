@@ -4,6 +4,8 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from src.core.config import settings
 from src.bot.handlers import router
 
@@ -21,14 +23,21 @@ async def main():
         logger.error("BOT_TOKEN is not set in environment variables! Please set it in .env")
         return
 
-    bot = Bot(token=settings.BOT_TOKEN)
+    bot = Bot(
+        token=settings.BOT_TOKEN, 
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
     
     if settings.USE_LOCAL_API:
         logger.info("Configuring Bot to use Local Telegram API Server...")
         session = AiohttpSession(
             api=TelegramAPIServer.from_base('http://telegram-bot-api:8081', is_local=True)
         )
-        bot = Bot(token=settings.BOT_TOKEN, session=session)
+        bot = Bot(
+            token=settings.BOT_TOKEN, 
+            session=session,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        )
 
     dp = Dispatcher()
 

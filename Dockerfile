@@ -1,35 +1,47 @@
 # === Build Stage ===
-FROM python:3.11-alpine as builder
+FROM python:3.12-alpine as builder
 
-WORKDIR /app
+WORKDIR /build
 
 # Install build dependencies
 RUN apk add --no-cache build-base
 
 COPY requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
+# Build wheels for all dependencies (no-deps removed so it builds everything)
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
 
 # === Production Stage ===
-FROM python:3.11-alpine
+FROM python:3.12-alpine
 
-# Create directories
-RUN mkdir -p /app/data /app/downloads
-
-# Install runtime dependencies (ffmpeg)
-RUN apk add --no-cache ffmpeg
+# Set environment variables for Python
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy wheels from builder and install
-COPY --from=builder /app/wheels /wheels
-COPY --from=builder /app/requirements.txt .
-RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
+# Install runtime dependencies (ffmpeg) and create non-root user
+RUN apk add --no-cache ffmpeg && \
+    addgroup -S botgroup && \
+    adduser -S botuser -G botgroup && \
+    mkdir -p /app/data /app/downloads && \
+    chown -R botuser:botgroup /app
+
+# Copy wheels and install
+COPY --from=builder /build/wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && \
+    rm -rf /wheels && \
+    # Aggressive cleanup of python caches and unused files
+    find /usr/local -depth \
+    \( \
+        -type d -a \( -name test -o -name tests -o -name idle_test -o -name __pycache__ \) \
+    \) -exec rm -rf '{}' + || true && \
+    find /usr/local -type f -name '*.pyc' -delete || true
 
 # Copy application code
-COPY src/ /app/src/
+COPY --chown=botuser:botgroup src/ /app/src/
 
-# Remove any pycache and unnecessary files to reduce image size
-RUN find . -type d -name "__pycache__" -exec rm -r {} + || true
+# Switch to non-root user
+USER botuser
 
-# Default command (Bot)
+# Default command
 CMD ["python", "-m", "src.bot.main"]
