@@ -5,12 +5,15 @@ import yt_dlp
 from typing import Dict, Any, Optional, Tuple
 import logging
 from src.core.config import settings
+from src.core.validator import validate_and_prepare_media
+from src.core.exceptions import ValidationError
 from urllib.parse import urlparse
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_DIR = "downloads"
+COOKIES_FILE = "cookies/cookies.txt"
 
 # In-memory caches for fast responsiveness
 _info_cache = TTLCache(maxsize=100, ttl=3600)
@@ -25,7 +28,6 @@ def is_valid_url(url: str) -> bool:
         return False
 
 # Base predefined formats for safe execution
-# Relaxed formats to handle Instagram, TikTok properly instead of strictly forcing AVC
 BASE_VIDEO_FORMATS = [
     {"id": "best", "label": "Highest Quality", "height": 9999, "fmt": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"},
     {"id": "4k", "label": "4K (2160p)", "height": 2160, "fmt": "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"},
@@ -50,9 +52,12 @@ def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_
         'max_filesize': settings.MAX_FILESIZE_BYTES,
         'restrictfilenames': True,
         'no_color': True,
-        'cachedir': False, # Disable disk caching to save space/IO
+        'cachedir': False,
     }
     
+    if os.path.exists(COOKIES_FILE):
+        options['cookiefile'] = COOKIES_FILE
+        
     if progress_callback:
         options['progress_hooks'] = [progress_callback]
     
@@ -76,7 +81,6 @@ def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_
     return options
 
 async def fetch_info(url: str) -> Optional[Dict[str, Any]]:
-    """Extract metadata and intelligently filter available formats with caching."""
     if not is_valid_url(url):
         logger.warning(f"Invalid URL attempted: {url}")
         return None
@@ -86,10 +90,12 @@ async def fetch_info(url: str) -> Optional[Dict[str, Any]]:
         
     def _extract():
         ydl_opts = {'quiet': True, 'noplaylist': True, 'cachedir': False}
+        if os.path.exists(COOKIES_FILE):
+            ydl_opts['cookiefile'] = COOKIES_FILE
+            
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
-                
                 max_height = 0
                 for f in info.get('formats', []):
                     h = f.get('height')
@@ -125,15 +131,16 @@ async def fetch_info(url: str) -> Optional[Dict[str, Any]]:
                 logger.error(f"Error extracting info for {url}: {e}")
                 return None
 
-    result = await asyncio.to_thread(_extract)
-    if result:
-        _info_cache[url] = result
-    return result
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=settings.YTDLP_TIMEOUT)
+        if result:
+            _info_cache[url] = result
+        return result
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout extracting info for {url}")
+        return None
 
 async def download_media(url: str, format_id: str = 'best', is_audio: bool = False, progress_callback=None) -> Tuple[bool, str, str]:
-    """
-    Download media safely using a Semaphore to limit concurrency.
-    """
     if not is_valid_url(url):
         return False, "Invalid URL provided.", ""
         
@@ -154,13 +161,35 @@ async def download_media(url: str, format_id: str = 'best', is_audio: bool = Fal
                 return False, f"File is too large (max {settings.MAX_FILESIZE_BYTES // (1024*1024)}MB).", ""
             return False, "Download failed or unsupported format for this URL.", ""
         except Exception as e:
+            if str(e) == "DownloadCancelled":
+                raise e
             logger.error(f"Unexpected error for {url}: {e}")
             return False, "An unexpected error occurred.", ""
 
-    return await asyncio.to_thread(_download)
+    try:
+        success, path, title = await asyncio.wait_for(asyncio.to_thread(_download), timeout=settings.YTDLP_TIMEOUT)
+        
+        if success:
+            try:
+                path = await validate_and_prepare_media(path, is_audio)
+            except ValidationError as ve:
+                if os.path.exists(path):
+                    os.remove(path)
+                raise ve
+                
+        return success, path, title
+    except asyncio.TimeoutError:
+        logger.error(f"Download timeout for {url}")
+        if os.path.exists(expected_final_path):
+            os.remove(expected_final_path)
+        return False, "Download timed out.", ""
+    except Exception as e:
+        if str(e) == "DownloadCancelled":
+            raise e
+        logger.error(f"Error during download for {url}: {e}")
+        return False, f"Download failed: {e}", ""
 
 async def search_media(query: str, limit: int = 10) -> Optional[list]:
-    """Search for media using yt-dlp with caching."""
     cache_key = f"{query}_{limit}"
     if cache_key in _search_cache:
         return _search_cache[cache_key]
@@ -172,6 +201,9 @@ async def search_media(query: str, limit: int = 10) -> Optional[list]:
             'noplaylist': True,
             'cachedir': False
         }
+        if os.path.exists(COOKIES_FILE):
+            ydl_opts['cookiefile'] = COOKIES_FILE
+            
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -195,7 +227,11 @@ async def search_media(query: str, limit: int = 10) -> Optional[list]:
                 logger.error(f"Search error for '{query}': {e}")
                 return None
 
-    results = await asyncio.to_thread(_search)
-    if results:
-        _search_cache[cache_key] = results
-    return results
+    try:
+        results = await asyncio.wait_for(asyncio.to_thread(_search), timeout=settings.YTDLP_TIMEOUT)
+        if results:
+            _search_cache[cache_key] = results
+        return results
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout searching for '{query}'")
+        return None

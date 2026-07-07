@@ -11,6 +11,7 @@ from src.bot.keyboards import (
     search_results_keyboard
 )
 from src.core.downloader import download_media, fetch_info, search_media
+from src.core.exceptions import ValidationError, RepairFailedError
 import os
 import time
 import logging
@@ -244,6 +245,8 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
 
 
 async def _background_download_task(callback: CallbackQuery, url: str, format_id: str, is_audio: bool, state: FSMContext, loop: asyncio.AbstractEventLoop):
+    from src.core.logger import reference_id_var
+    ref_id = reference_id_var.get()
     logger.info(f"Starting download for URL: {url} | Format: {format_id}")
     last_update_time = time.time()
     
@@ -281,7 +284,6 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                         f"⏱ <b>ETA:</b> {eta}"
                     )
                     
-                    # Schedule update safely on the main event loop
                     asyncio.run_coroutine_threadsafe(
                         callback.message.edit_text(text, reply_markup=cancel_keyboard()),
                         loop
@@ -291,41 +293,34 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
 
     try:
         success, result, title = await download_media(url, format_id=format_id, is_audio=is_audio, progress_callback=progress_hook)
-    except Exception as e:
-        if str(e) == "DownloadCancelled":
-            if url in cancelled_downloads:
-                cancelled_downloads.remove(url)
-            logger.info(f"Download cancelled by user: {url}")
+        
+        if url in cancelled_downloads:
+            cancelled_downloads.remove(url)
+            if result and os.path.exists(result):
+                os.remove(result)
+            logger.info(f"Download cancelled by user after completion: {url}")
             return
-        success, result, title = False, str(e), ""
-    
-    if url in cancelled_downloads:
-        cancelled_downloads.remove(url)
-        if result and os.path.exists(result):
-            os.remove(result)
-        logger.info(f"Download cancelled by user after completion: {url}")
-        return
+            
+        await state.clear()
         
-    await state.clear()
-    
-    if not success:
-        logger.error(f"Failed to download {url}: {result}")
-        await callback.message.edit_text(
-            f"❌ <b>Error downloading:</b> {result}",
-            reply_markup=post_download_keyboard()
-        )
-        return
+        if not success:
+            logger.error(f"Failed to download {url}: {result}")
+            err_text = f"❌ <b>Error downloading:</b>\n{result}"
+            if ref_id:
+                err_text += f"\n\n<i>Reference ID: {ref_id}</i>"
+                
+            await callback.message.edit_text(
+                err_text,
+                reply_markup=post_download_keyboard()
+            )
+            return
+            
+        file_size_bytes = os.path.getsize(result) if os.path.exists(result) else 0
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        logger.info(f"Download successful: {url} | File: {result} | Size: {file_size_mb:.2f} MB")
+            
+        await callback.message.edit_text(f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>")
         
-    file_size_bytes = os.path.getsize(result) if os.path.exists(result) else 0
-    file_size_mb = file_size_bytes / (1024 * 1024)
-    logger.info(f"Download successful: {url} | File: {result} | Size: {file_size_mb:.2f} MB")
-        
-    await callback.message.edit_text(f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>")
-    
-    try:
-        from src.core.config import settings
-        
-        # Format the beautiful caption
         caption = (
             f"🎥 <b>{title}</b>\n\n"
             f"📊 <b>Size:</b> {file_size_mb:.2f} MB\n"
@@ -333,19 +328,22 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
             f"⚡️ <i>Downloaded via @XinDL</i>"
         )
         
-        # Extremely fast local upload via file:// protocol (bypasses HTTP entirely)
-        # Using abspath ensures local API server finds it correctly inside the shared mount
         local_uri = f"file://{os.path.abspath(result)}"
         
         if not is_audio:
             await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-            await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=30)
+            await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=60)
         else:
             await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-            await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=30)
+            await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=60)
             
         logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
-        await callback.message.delete()
+        
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+            
         await callback.message.answer(
             "✅ <b>Download Complete!</b>\n\nWhat would you like to do next?", 
             reply_markup=post_download_keyboard()
@@ -354,16 +352,41 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
     except TelegramRetryAfter as e:
         logger.warning(f"Rate limited by Telegram. Retry after {e.retry_after}")
         await callback.message.edit_text(f"❌ Rate limited by Telegram. Please try again after {e.retry_after} seconds.")
-    except TelegramNetworkError as e:
-        logger.error(f"Network error while uploading {result}: {e}")
-        await callback.message.edit_text("❌ Network error while uploading to Telegram. The file might be too large.")
     except Exception as e:
-        logger.error(f"Unexpected error uploading to Telegram {result}: {e}")
-        await callback.message.edit_text("❌ An unexpected error occurred during upload.")
-    finally:
-        if os.path.exists(result):
+        if str(e) == "DownloadCancelled":
+            if url in cancelled_downloads:
+                cancelled_downloads.remove(url)
+            logger.info(f"Download cancelled by user: {url}")
+            return
+            
+        if isinstance(e, ValidationError):
+            logger.warning(f"Validation Error caught for {url}: {e.message}")
+            err_msg = f"❌ <b>Validation Failed:</b>\n{e.message}"
+            if ref_id:
+                err_msg += f"\n\n<i>Reference ID: {ref_id}</i>"
+                
+            if getattr(e, 'fallback_suggested', False) and not is_audio:
+                err_msg += "\n\n💡 <i>The video is corrupted. Please tap 'Download Another' and try the Audio Only option.</i>"
+                
             try:
+                await callback.message.edit_text(err_msg, reply_markup=post_download_keyboard())
+            except Exception:
+                pass
+            return
+            
+        logger.exception(f"Unexpected error in background download task for {url}: {e}")
+        err_msg = "❌ An unexpected error occurred."
+        if ref_id:
+            err_msg += f"\n\n<i>Reference ID: {ref_id}</i>"
+        try:
+            await callback.message.edit_text(err_msg, reply_markup=post_download_keyboard())
+        except Exception:
+            pass
+    finally:
+        # Cleanup
+        try:
+            if 'result' in locals() and result and os.path.exists(result):
                 os.remove(result)
                 logger.info(f"Cleaned up file: {result}")
-            except Exception as e:
-                logger.error(f"Failed to remove file {result}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to remove file: {e}")

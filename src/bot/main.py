@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -8,14 +7,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from src.core.config import settings
 from src.bot.handlers import router
+from src.core.logger import setup_logger
+from src.bot.middlewares import RequestContextMiddleware
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
-)
-logger = logging.getLogger(__name__)
+logger = setup_logger()
 
 async def main():
     logger.info("Starting Telegram Bot...")
@@ -40,6 +35,9 @@ async def main():
         )
 
     dp = Dispatcher()
+    
+    # Register middlewares
+    dp.update.middleware(RequestContextMiddleware())
 
     # Include routers
     dp.include_router(router)

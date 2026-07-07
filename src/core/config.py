@@ -5,6 +5,7 @@ from typing import List
 class Settings(BaseSettings):
     # Application Settings
     ENVIRONMENT: str = "development"
+    LOG_LEVEL: str = "INFO"
 
     # Telegram Bot Settings
     BOT_TOKEN: str = "default_token_override_me"
@@ -16,6 +17,8 @@ class Settings(BaseSettings):
     
     # Download Settings
     MAX_FILESIZE_BYTES: int = 2000 * 1024 * 1024 # 2000MB
+    MAX_CONCURRENT_DOWNLOADS: int = 5
+    YTDLP_TIMEOUT: int = 300 # 5 minutes timeout per download step
     
     @property
     def admin_ids_list(self) -> List[int]:

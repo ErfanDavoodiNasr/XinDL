@@ -32,6 +32,7 @@ SERVER_USER=${SERVER_USER:-root}
 PROJECT_DIR=${PROJECT_DIR:-/opt/XinDL}
 
 function deploy_bot() {
+    find . -type f -name '._*' -delete && find . -depth -type d -empty -delete
     echo -e "\n${YELLOW}[*] Starting Deployment...${NC}"
     
     if ! command -v sshpass &> /dev/null; then

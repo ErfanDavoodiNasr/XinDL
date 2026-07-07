@@ -10,3 +10,4 @@ cachetools==7.1.4
 # Configuration & Utilities
 pydantic-settings==2.14.2
 python-dotenv==1.2.2
+python-json-logger==2.0.7
