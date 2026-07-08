@@ -1,25 +1,33 @@
+# syntax=docker/dockerfile:1
 # === Build Stage ===
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+# Install build dependencies (host network required on servers with broken docker bridge)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip wheel --wheel-dir /build/wheels -r requirements.txt
 
 # === Production Stage ===
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
-# Set environment variables for Python
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PATH="/usr/local/bin:${PATH}"
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg, deno for yt-dlp EJS) and create non-root user
-RUN apt-get update && \
+# Runtime deps: ffmpeg, nodejs (yt-dlp EJS), deno, non-root user
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg nodejs libcurl4 unzip ca-certificates curl && \
     curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     rm -rf /var/lib/apt/lists/* && \
@@ -28,17 +36,12 @@ RUN apt-get update && \
     mkdir -p /app/data /app/downloads /app/cookies && \
     chown -R botuser:botgroup /app
 
-# Copy wheels and install
 COPY --from=builder /build/wheels /wheels
-RUN pip install --no-cache-dir /wheels/* && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir /wheels/* && \
     rm -rf /wheels && \
     find /usr/local -type d -name __pycache__ -prune -exec rm -rf {} + || true
 
-# Copy application code
 COPY --chown=botuser:botgroup src/ /app/src/
 
-# Run as root to ensure volume writes (downloads, etc) succeed with named volumes.
-# (botuser created for potential future, but volumes need root write on some setups)
-# Default command
 CMD ["python", "-m", "src.bot.main"]
-

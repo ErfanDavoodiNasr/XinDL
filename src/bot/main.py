@@ -26,7 +26,7 @@ async def main():
     if settings.USE_LOCAL_API:
         logger.info("Configuring Bot to use Local Telegram API Server...")
         session = AiohttpSession(
-            api=TelegramAPIServer.from_base('http://telegram-bot-api:8081', is_local=True)
+            api=TelegramAPIServer.from_base(settings.TELEGRAM_LOCAL_API_URL, is_local=True)
         )
         bot = Bot(
             token=settings.BOT_TOKEN, 

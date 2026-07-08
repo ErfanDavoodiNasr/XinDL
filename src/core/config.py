@@ -13,7 +13,8 @@ class Settings(BaseSettings):
     
     USE_LOCAL_API: bool = False
     TELEGRAM_API_ID: int = 0
-    TELEGRAM_API_HASH: str = "" # Comma-separated
+    TELEGRAM_API_HASH: str = ""
+    TELEGRAM_LOCAL_API_URL: str = "http://127.0.0.1:8081"
     
     # Download Settings
     MAX_FILESIZE_BYTES: int = 2000 * 1024 * 1024 # legacy, not enforced (large files auto-split into 2GB parts)

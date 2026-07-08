@@ -2,11 +2,16 @@ services:
   bot:
     build:
       context: .
+      network: host
+    image: xindl-bot
     container_name: xindl_bot
     restart: unless-stopped
+    network_mode: host
     command: python -m src.bot.main
     env_file:
       - .env
+    environment:
+      TELEGRAM_LOCAL_API_URL: http://127.0.0.1:8081
     volumes:
       - downloads_data:/app/downloads
       - ./cookies:/app/cookies
@@ -22,6 +27,7 @@ services:
     image: aiogram/telegram-bot-api:latest
     container_name: xindl_tg_api
     restart: unless-stopped
+    network_mode: host
     environment:
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
