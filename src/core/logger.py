@@ -16,22 +16,23 @@ class ReferenceIdFilter(logging.Filter):
         return True
 
 def setup_logger():
-    """Configure structured JSON logging."""
-    logger = logging.getLogger()
+    """Configure structured JSON logging. Much richer for debug."""
+    root = logging.getLogger()
     
     # Remove existing handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
         
     log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-    logger.setLevel(log_level)
+    root.setLevel(log_level)
     
     logHandler = logging.StreamHandler(sys.stdout)
     
-    # Define JSON formatter
+    # Define JSON formatter - include extra fields, ref always if set
     formatter = jsonlogger.JsonFormatter(
         '%(asctime)s %(levelname)s %(name)s %(message)s',
-        rename_fields={"levelname": "level", "asctime": "timestamp"}
+        rename_fields={"levelname": "level", "asctime": "timestamp"},
+        json_ensure_ascii=False
     )
     
     logHandler.setFormatter(formatter)
@@ -39,6 +40,16 @@ def setup_logger():
     # Add filter to inject reference_id
     logHandler.addFilter(ReferenceIdFilter())
     
-    logger.addHandler(logHandler)
+    root.addHandler(logHandler)
     
-    return logger
+    # yt_dlp gets same handler + level for complete trace (SABR, format skips etc)
+    yt_logger = logging.getLogger('yt_dlp')
+    yt_logger.setLevel(log_level)
+    yt_logger.addHandler(logHandler)
+    yt_logger.propagate = False
+    
+    # Reduce noise from libs in prod
+    logging.getLogger('aiohttp').setLevel(logging.WARNING)
+    logging.getLogger('aiogram').setLevel(logging.WARNING)
+    
+    return root

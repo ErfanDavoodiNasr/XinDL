@@ -1,5 +1,5 @@
 # === Build Stage ===
-FROM python:3.12-slim as builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
@@ -20,7 +20,7 @@ WORKDIR /app
 
 # Install runtime dependencies (ffmpeg) and create non-root user
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg nodejs libcurl4 && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r botgroup && \
     useradd -r -g botgroup botuser && \
@@ -36,9 +36,8 @@ RUN pip install --no-cache-dir /wheels/* && \
 # Copy application code
 COPY --chown=botuser:botgroup src/ /app/src/
 
-# Switch to non-root user
-USER botuser
-
+# Run as root to ensure volume writes (downloads, etc) succeed with named volumes.
+# (botuser created for potential future, but volumes need root write on some setups)
 # Default command
 CMD ["python", "-m", "src.bot.main"]
 

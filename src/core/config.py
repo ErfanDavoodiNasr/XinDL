@@ -16,9 +16,10 @@ class Settings(BaseSettings):
     TELEGRAM_API_HASH: str = "" # Comma-separated
     
     # Download Settings
-    MAX_FILESIZE_BYTES: int = 2000 * 1024 * 1024 # 2000MB
-    MAX_CONCURRENT_DOWNLOADS: int = 5
-    YTDLP_TIMEOUT: int = 300 # 5 minutes timeout per download step
+    MAX_FILESIZE_BYTES: int = 2000 * 1024 * 1024 # legacy, not enforced (large files auto-split into 2GB parts)
+    MAX_CONCURRENT_DOWNLOADS: int = 3
+    MAX_CONCURRENT_INFO: int = 5
+    YTDLP_TIMEOUT: int = 300
     
     @property
     def admin_ids_list(self) -> List[int]:

@@ -56,3 +56,8 @@ Thumbs.db
 
 # Docker
 .dockerignore
+
+# Cookies (secrets - never commit real cookies!)
+cookies.txt
+cookies/cookies.txt
+!cookies/.gitkeep

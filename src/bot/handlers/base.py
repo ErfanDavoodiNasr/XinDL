@@ -7,10 +7,11 @@ from src.bot.keyboards import (
     download_format_keyboard, 
     cancel_keyboard, 
     post_download_keyboard, 
-    main_menu_keyboard,
-    search_results_keyboard
+    main_menu_keyboard
 )
-from src.core.downloader import download_media, fetch_info, search_media
+from src.core.downloader import download_media, fetch_info, split_large_file
+from src.core.platforms import is_supported_url, unsupported_message, extract_url
+import shutil
 from src.core.exceptions import ValidationError, RepairFailedError
 import os
 import time
@@ -19,6 +20,7 @@ import asyncio
 import re
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.enums import ChatAction
+from html import escape
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -26,7 +28,6 @@ router = Router()
 class DownloadState(StatesGroup):
     waiting_for_format = State()
     downloading = State() # To track active downloads for cancellation
-    searching = State() # Viewing search results
 
 # Soft-cancel registry (In-memory flag to stop uploads if cancelled)
 cancelled_downloads = set()
@@ -34,22 +35,23 @@ cancelled_downloads = set()
 def get_welcome_text() -> str:
     return (
         "👋 <b>Welcome to XinDL!</b>\n\n"
-        "I am your lightning-fast, premium media downloader.\n"
-        "Simply send me a link from <b>YouTube</b>, <b>Instagram</b>, <b>TikTok</b>, or <b>Twitter/X</b>, "
-        "and I will fetch it for you in the highest quality available.\n\n"
-        "You can also <b>type any text</b> to search for media!\n\n"
-        "👇 <i>Just paste a link or type a search below to get started!</i>"
+        "Fast media downloader for <b>YouTube</b>, <b>Instagram</b>, and <b>SoundCloud</b>.\n"
+        "Paste a direct link and pick quality from lowest to highest available.\n\n"
+        "👇 <i>Send a link to get started!</i>"
     )
 
 def get_help_text() -> str:
     return (
-        "ℹ️ <b>XinDL Help Center</b>\n\n"
+        "ℹ️ <b>XinDL Help</b>\n\n"
+        "<b>Supported platforms:</b>\n"
+        "• YouTube (videos, shorts, music)\n"
+        "• Instagram (reels, posts, stories)\n"
+        "• SoundCloud (tracks, playlists)\n\n"
         "<b>How to use:</b>\n"
-        "1. Copy a link from a supported platform (YouTube, Insta, TikTok, X) and paste it.\n"
-        "2. OR simply type what you want to search for.\n"
-        "3. Choose your preferred video resolution or audio format.\n"
-        "4. Wait a moment, and the file will be sent directly to you!\n\n"
-        "💡 <i>Tip:</i> The 'Best Quality' button automatically picks the absolute highest resolution available."
+        "1. Paste a direct link.\n"
+        "2. Pick video quality (lowest → highest) or audio only.\n"
+        "3. Wait — file arrives in chat.\n\n"
+        "💡 <i>Tip:</i> Lower quality = faster download & smaller file."
     )
 
 @router.message(CommandStart())
@@ -71,13 +73,22 @@ async def callback_help(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "new_dl")
 async def callback_new_dl(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("👇 <i>Please send me the new link or search query.</i>")
+    await callback.message.edit_text("👇 <i>Please send me a direct media link.</i>")
 
 # Handle URLs
-@router.message(F.text.regexp(r'https?://[^\s]+'))
+@router.message(F.text.regexp(r'https?://'))
 async def handle_url(message: Message, state: FSMContext):
-    url = message.text.strip()
-    
+    url = extract_url(message.text or "")
+    if not url:
+        await message.reply("لینک معتبر پیدا نشد. یک لینک https:// بفرست.")
+        return
+
+    logger.info(f"URL received | chat={message.chat.id} user={getattr(message.from_user, 'id', None)} url={url[:70]}")
+
+    if not is_supported_url(url):
+        await message.reply(unsupported_message())
+        return
+
     msg = await message.reply("🔍 <i>Analyzing available qualities...</i>")
     
     # We await fetch_info directly here because it is fast (uses to_thread + caching)
@@ -86,114 +97,31 @@ async def handle_url(message: Message, state: FSMContext):
         await msg.edit_text("❌ <i>Could not extract information.</i> Please ensure it's a valid, public media link.")
         return
 
-    title = info.get('title', 'Unknown Title')
+    title = escape(info.get('title', 'Unknown Title') or 'Unknown Title')
     formats = info.get('formats', {})
-    
+    vcount = len(formats.get('video', []))
+    acount = len(formats.get('audio', []))
+    logger.info(f"fetch done | title={title[:40]} video_options={vcount} audio_options={acount}")
+
     await state.update_data(url=url, msg_id=msg.message_id)
     await state.set_state(DownloadState.waiting_for_format)
-    
-    text = f"🎥 <b>{title}</b>\n\n👇 <i>Choose your preferred download quality:</i>"
+
+    if vcount == 0 and acount > 0:
+        text = f"🎵 <b>{title}</b>\n\n👇 <i>Audio only — choose quality (low → high):</i>"
+    else:
+        text = f"🎥 <b>{title}</b>\n\n👇 <i>Choose quality (low → high):</i>"
     await msg.edit_text(text, reply_markup=download_format_keyboard(formats))
-
-# Handle Search Text
-@router.message(F.text)
-async def handle_search(message: Message, state: FSMContext):
-    query = message.text.strip()
-    if query == "ℹ️ Help" or query.startswith("/"):
-        return
-        
-    msg = await message.reply(f"🔍 <i>Searching for '{query}'...</i>")
-    
-    results = await search_media(query, limit=10)
-    
-    if not results:
-        await msg.edit_text("❌ <i>No results found.</i> Please try a different search term.")
-        return
-        
-    await state.update_data(search_results=results, current_index=0, msg_id=msg.message_id)
-    await state.set_state(DownloadState.searching)
-    
-    await display_search_result(msg, results, 0)
-
-async def display_search_result(msg: Message, results: list, index: int):
-    result = results[index]
-    title = result.get('title', 'Unknown Title')
-    uploader = result.get('uploader', 'Unknown')
-    duration = result.get('duration', 0)
-    thumbnail = result.get('thumbnail')
-    
-    minutes, seconds = divmod(duration, 60)
-    duration_str = f"{minutes}:{seconds:02d}"
-    
-    thumb_html = f"<a href='{thumbnail}'>&#8205;</a>" if thumbnail else ""
-    
-    text = (
-        f"{thumb_html}🔎 <b>Search Result {index + 1}/{len(results)}</b>\n\n"
-        f"🎥 <b>{title}</b>\n"
-        f"👤 <i>{uploader}</i> | ⏱ <i>{duration_str}</i>"
-    )
-    
-    try:
-        await msg.edit_text(
-            text, 
-            reply_markup=search_results_keyboard(len(results), index, result.get('url')),
-            disable_web_page_preview=False
-        )
-    except Exception as e:
-        logger.error(f"Error editing message: {e}")
-
-@router.callback_query(F.data.startswith("search_nav_"), DownloadState.searching)
-async def search_nav(callback: CallbackQuery, state: FSMContext):
-    index = int(callback.data.split("_")[2])
-    data = await state.get_data()
-    results = data.get("search_results", [])
-    
-    if not results or index < 0 or index >= len(results):
-        await callback.answer("❌ Invalid navigation.", show_alert=True)
-        return
-        
-    await state.update_data(current_index=index)
-    await display_search_result(callback.message, results, index)
-    await callback.answer()
-
-@router.callback_query(F.data == "cancel_search", DownloadState.searching)
-async def cancel_search(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("🛑 <b>Search Cancelled.</b>\n\nYou can send a new link or search query.")
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("search_dl_"), DownloadState.searching)
-async def search_dl(callback: CallbackQuery, state: FSMContext):
-    index = int(callback.data.split("_")[2])
-    data = await state.get_data()
-    results = data.get("search_results", [])
-    
-    if not results or index < 0 or index >= len(results):
-        await callback.answer("❌ Invalid selection.", show_alert=True)
-        return
-        
-    url = results[index].get('url')
-    
-    await callback.message.edit_text("🔍 <i>Analyzing available qualities...</i>")
-    
-    info = await fetch_info(url)
-    if not info:
-        await callback.message.edit_text("❌ <i>Could not extract information.</i>")
-        return
-
-    title = info.get('title', 'Unknown Title')
-    formats = info.get('formats', {})
-    
-    await state.update_data(url=url)
-    await state.set_state(DownloadState.waiting_for_format)
-    
-    text = f"🎥 <b>{title}</b>\n\n👇 <i>Choose your preferred download quality:</i>"
-    await callback.message.edit_text(text, reply_markup=download_format_keyboard(formats))
-
 
 @router.callback_query(F.data == "ignore")
 async def ignore_callback(callback: CallbackQuery):
     await callback.answer()
+
+# Non-link text: tell user only direct links are supported (search removed)
+@router.message(F.text)
+async def handle_non_link(message: Message, state: FSMContext):
+    if message.text.strip() in ("ℹ️ Help",) or message.text.startswith("/"):
+        return
+    await message.reply("فقط YouTube، Instagram و SoundCloud ساپورت می‌شن. لینک مستقیم بفرست.")
 
 @router.callback_query(F.data == "cancel_dl")
 async def cancel_download(callback: CallbackQuery, state: FSMContext):
@@ -213,7 +141,7 @@ def build_progress_bar(percent: float) -> str:
 
 @router.callback_query(F.data.startswith("dl_"), DownloadState.waiting_for_format)
 async def process_download(callback: CallbackQuery, state: FSMContext):
-    data_parts = callback.data.split("_")
+    data_parts = callback.data.split("_", 2)
     media_type = data_parts[1]
     format_id = data_parts[2]
     
@@ -233,6 +161,7 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     if url in cancelled_downloads:
         cancelled_downloads.remove(url)
         
+    logger.info(f"download start | format={format_id} audio={is_audio} chat={callback.message.chat.id}")
     await callback.message.edit_text(
         "⏳ <b>Downloading... Please wait.</b>\n<i>(This may take a moment depending on file size)</i>",
         reply_markup=cancel_keyboard()
@@ -284,10 +213,14 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                         f"⏱ <b>ETA:</b> {eta}"
                     )
                     
-                    asyncio.run_coroutine_threadsafe(
-                        callback.message.edit_text(text, reply_markup=cancel_keyboard()),
-                        loop
-                    )
+                    try:
+                        edit_coro = callback.message.edit_text(text, reply_markup=cancel_keyboard())
+                        if asyncio.iscoroutine(edit_coro):
+                            asyncio.run_coroutine_threadsafe(edit_coro, loop)
+                        else:
+                            logger.warning(f"edit_text returned non-coro: {type(edit_coro)}")
+                    except Exception as sched_e:
+                        logger.warning(f"Error scheduling progress UI update: {sched_e}")
                 except Exception as e:
                     logger.warning(f"Error scheduling progress UI update: {e}")
 
@@ -318,26 +251,61 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         file_size_bytes = os.path.getsize(result) if os.path.exists(result) else 0
         file_size_mb = file_size_bytes / (1024 * 1024)
         logger.info(f"Download successful: {url} | File: {result} | Size: {file_size_mb:.2f} MB")
-            
-        await callback.message.edit_text(f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>")
         
-        caption = (
-            f"🎥 <b>{title}</b>\n\n"
-            f"📊 <b>Size:</b> {file_size_mb:.2f} MB\n"
-            f"⚙️ <b>Quality:</b> {format_id}\n\n"
-            f"⚡️ <i>Downloaded via @XinDL</i>"
-        )
+        MAX_PART_BYTES = 2 * 1024 * 1024 * 1024
+        safe_title = escape(title or 'media')
         
-        local_uri = f"file://{os.path.abspath(result)}"
-        
-        if not is_audio:
-            await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-            await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=60)
+        if file_size_bytes > MAX_PART_BYTES:
+            await callback.message.edit_text(f"✂️ <b>Splitting into ~2GB parts...</b>\n<i>Total size: {file_size_mb:.1f} MB</i>")
+            parts = split_large_file(result, MAX_PART_BYTES)
+            n = len(parts)
+            for i, part_path in enumerate(parts, 1):
+                p_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                part_cap = (
+                    f"🎥 <b>{safe_title}</b>\n\n"
+                    f"📊 Part {i}/{n} | Size: {p_size_mb:.1f} MB\n"
+                    f"⚙️ Quality: {format_id}\n\n"
+                    f"⚡️ <i>Downloaded via @XinDL</i>"
+                )
+                part_uri = f"file://{os.path.abspath(part_path)}"
+                if not is_audio:
+                    await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
+                    await callback.message.answer_video(video=part_uri, caption=part_cap, request_timeout=120)
+                else:
+                    await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+                    await callback.message.answer_audio(audio=part_uri, caption=part_cap, request_timeout=120)
+                try:
+                    os.remove(part_path)
+                except:
+                    pass
+            # cleanup parts dir and original
+            try:
+                parts_dir = result + "_parts"
+                if os.path.isdir(parts_dir):
+                    shutil.rmtree(parts_dir, ignore_errors=True)
+            except:
+                pass
+            try:
+                os.remove(result)
+            except:
+                pass
+            logger.info(f"Sent {n} parts for large file {url}")
         else:
-            await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-            await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=60)
-            
-        logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
+            await callback.message.edit_text(f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>")
+            caption = (
+                f"🎥 <b>{safe_title}</b>\n\n"
+                f"📊 <b>Size:</b> {file_size_mb:.2f} MB\n"
+                f"⚙️ <b>Quality:</b> {format_id}\n\n"
+                f"⚡️ <i>Downloaded via @XinDL</i>"
+            )
+            local_uri = f"file://{os.path.abspath(result)}"
+            if not is_audio:
+                await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
+                await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=60)
+            else:
+                await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+                await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=60)
+            logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
         
         try:
             await callback.message.delete()

@@ -41,7 +41,7 @@ function deploy_bot() {
     fi
     
     echo -e "${YELLOW}[*] Compressing local project for upload...${NC}"
-    tar --exclude='venv' --exclude='.git' --exclude='data' --exclude='downloads' --exclude='__pycache__' -czf /tmp/xindl_deploy.tar.gz .
+    tar --exclude='venv' --exclude='.git' --exclude='data' --exclude='downloads' --exclude='__pycache__' --exclude='cookies/cookies.txt' --exclude='cookies.txt' -czf /tmp/xindl_deploy.tar.gz .
     
     echo -e "${YELLOW}[*] Creating target directory on server...${NC}"
     sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SERVER_USER@$SERVER_IP" "mkdir -p $PROJECT_DIR"
