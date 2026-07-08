@@ -18,9 +18,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg) and create non-root user
+# Install runtime dependencies (ffmpeg, deno for yt-dlp EJS) and create non-root user
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg nodejs libcurl4 && \
+    apt-get install -y --no-install-recommends ffmpeg nodejs libcurl4 unzip ca-certificates curl && \
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r botgroup && \
     useradd -r -g botgroup botuser && \

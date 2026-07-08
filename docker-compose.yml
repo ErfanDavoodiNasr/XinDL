@@ -9,11 +9,12 @@ services:
       - .env
     volumes:
       - downloads_data:/app/downloads
+      - ./cookies:/app/cookies
     deploy:
       resources:
         limits:
           cpus: '1.0'
-          memory: 768M
+          memory: 1024M
     depends_on:
       - telegram-bot-api
 

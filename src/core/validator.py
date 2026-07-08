@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Dict, Any, Tuple
 from src.core.exceptions import ValidationError, RepairFailedError
+from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -32,24 +33,36 @@ async def _get_ffprobe_data(file_path: str) -> Dict[str, Any]:
         raise ValidationError("File container is severely corrupted (ffprobe failed).")
     return json.loads(stdout)
 
-async def _count_frames(file_path: str) -> int:
-    """Counts video frames to detect 1-frame fake videos."""
+async def _estimate_frame_count(file_path: str, duration: float) -> int:
+    """Fast frame estimate from stream metadata — no full decode."""
     cmd = [
-        'ffprobe',
-        '-v', 'error',
-        '-count_frames',
+        'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_entries', 'stream=nb_read_frames',
-        '-of', 'default=nokey=1:noprint_wrappers=1',
-        file_path
+        '-show_entries', 'stream=nb_frames,r_frame_rate,avg_frame_rate',
+        '-of', 'json',
+        file_path,
     ]
     code, stdout, _ = await _run_command(*cmd)
     if code != 0:
-        return 0
+        return -1
     try:
-        return int(stdout.strip())
-    except ValueError:
-        return 0
+        data = json.loads(stdout)
+        streams = data.get('streams') or []
+        if not streams:
+            return -1
+        stream = streams[0]
+        nb = stream.get('nb_frames')
+        if nb and str(nb).isdigit():
+            return int(nb)
+        rate = stream.get('avg_frame_rate') or stream.get('r_frame_rate') or ''
+        if '/' in str(rate):
+            num, den = str(rate).split('/', 1)
+            fps = float(num) / float(den) if float(den) else 0.0
+            if fps > 0 and duration > 0:
+                return int(duration * fps)
+    except (ValueError, json.JSONDecodeError, ZeroDivisionError):
+        pass
+    return -1
 
 async def _attempt_repair(file_path: str, is_audio: bool) -> str:
     """Attempts to repair a broken file using ffmpeg."""
@@ -125,13 +138,14 @@ async def validate_and_prepare_media(file_path: str, is_audio: bool) -> str:
         if not is_audio and not has_video:
             raise ValidationError("Requested video, but no video stream found.", fallback_suggested=True)
             
-        if not is_audio and has_video:
-            # Deep check: Prevent 1-frame static videos (often signs of broken downloads)
-            # Only count frames if duration > 2 seconds to save time on tiny clips
+        if not is_audio and has_video and not settings.SKIP_FRAME_DECODE_VALIDATION:
             if duration > 2.0:
-                frame_count = await _count_frames(file_path)
-                if frame_count > 0 and frame_count < 5:
-                    raise ValidationError("Video appears to be a static image (stuck on single frame).", fallback_suggested=True)
+                frame_count = await _estimate_frame_count(file_path, duration)
+                if 0 < frame_count < 5:
+                    raise ValidationError(
+                        "Video appears to be a static image (stuck on single frame).",
+                        fallback_suggested=True,
+                    )
 
         return file_path
         

@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_CONCURRENT_INFO: int = 5
     YTDLP_TIMEOUT: int = 300
+    YTDLP_FRAGMENT_CONCURRENCY: int = 8
+    COOKIES_FILE: str = "cookies/cookies.txt"
+    USE_COOKIES: bool = False
+    SKIP_FRAME_DECODE_VALIDATION: bool = True
     
     @property
     def admin_ids_list(self) -> List[int]:

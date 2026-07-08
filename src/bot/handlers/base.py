@@ -139,6 +139,10 @@ def build_progress_bar(percent: float) -> str:
     empty = 10 - filled
     return f"[{'█' * filled}{'░' * empty}] {percent:.1f}%"
 
+def _upload_timeout_seconds(file_size_bytes: int) -> int:
+    size_mb = file_size_bytes / (1024 * 1024)
+    return max(120, int(size_mb * 3))
+
 @router.callback_query(F.data.startswith("dl_"), DownloadState.waiting_for_format)
 async def process_download(callback: CallbackQuery, state: FSMContext):
     data_parts = callback.data.split("_", 2)
@@ -168,12 +172,22 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     )
     
     loop = asyncio.get_running_loop()
-    asyncio.create_task(_background_download_task(callback, url, format_id, is_audio, state, loop))
+
+    async def _update_progress_ui(text: str) -> None:
+        try:
+            await callback.message.edit_text(text, reply_markup=cancel_keyboard())
+        except Exception:
+            pass
+
+    def _schedule_progress(text: str) -> None:
+        asyncio.run_coroutine_threadsafe(_update_progress_ui(text), loop)
+
+    asyncio.create_task(_background_download_task(callback, url, format_id, is_audio, state, loop, _schedule_progress))
     
     await callback.answer("Download started in background!", show_alert=False)
 
 
-async def _background_download_task(callback: CallbackQuery, url: str, format_id: str, is_audio: bool, state: FSMContext, loop: asyncio.AbstractEventLoop):
+async def _background_download_task(callback: CallbackQuery, url: str, format_id: str, is_audio: bool, state: FSMContext, loop: asyncio.AbstractEventLoop, schedule_progress):
     from src.core.logger import reference_id_var
     ref_id = reference_id_var.get()
     logger.info(f"Starting download for URL: {url} | Format: {format_id}")
@@ -205,22 +219,13 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                     eta = ansi_escape.sub('', eta)
                     
                     pbar = build_progress_bar(percent)
-                    
                     text = (
                         f"⏳ <b>Downloading...</b>\n\n"
                         f"{pbar}\n\n"
                         f"⚡️ <b>Speed:</b> {speed}\n"
                         f"⏱ <b>ETA:</b> {eta}"
                     )
-                    
-                    try:
-                        edit_coro = callback.message.edit_text(text, reply_markup=cancel_keyboard())
-                        if asyncio.iscoroutine(edit_coro):
-                            asyncio.run_coroutine_threadsafe(edit_coro, loop)
-                        else:
-                            logger.warning(f"edit_text returned non-coro: {type(edit_coro)}")
-                    except Exception as sched_e:
-                        logger.warning(f"Error scheduling progress UI update: {sched_e}")
+                    schedule_progress(text)
                 except Exception as e:
                     logger.warning(f"Error scheduling progress UI update: {e}")
 
@@ -251,10 +256,11 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         file_size_bytes = os.path.getsize(result) if os.path.exists(result) else 0
         file_size_mb = file_size_bytes / (1024 * 1024)
         logger.info(f"Download successful: {url} | File: {result} | Size: {file_size_mb:.2f} MB")
-        
+
         MAX_PART_BYTES = 2 * 1024 * 1024 * 1024
+        upload_timeout = _upload_timeout_seconds(file_size_bytes)
         safe_title = escape(title or 'media')
-        
+
         if file_size_bytes > MAX_PART_BYTES:
             await callback.message.edit_text(f"✂️ <b>Splitting into ~2GB parts...</b>\n<i>Total size: {file_size_mb:.1f} MB</i>")
             parts = split_large_file(result, MAX_PART_BYTES)
@@ -270,10 +276,10 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                 part_uri = f"file://{os.path.abspath(part_path)}"
                 if not is_audio:
                     await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-                    await callback.message.answer_video(video=part_uri, caption=part_cap, request_timeout=120)
+                    await callback.message.answer_video(video=part_uri, caption=part_cap, request_timeout=upload_timeout)
                 else:
                     await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                    await callback.message.answer_audio(audio=part_uri, caption=part_cap, request_timeout=120)
+                    await callback.message.answer_audio(audio=part_uri, caption=part_cap, request_timeout=upload_timeout)
                 try:
                     os.remove(part_path)
                 except:
@@ -301,10 +307,10 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
             local_uri = f"file://{os.path.abspath(result)}"
             if not is_audio:
                 await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-                await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=60)
+                await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=upload_timeout)
             else:
                 await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=60)
+                await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=upload_timeout)
             logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
         
         try:

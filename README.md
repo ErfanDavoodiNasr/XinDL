@@ -1,6 +1,7 @@
 # XinDL — Telegram Media Downloader Bot
 
-XinDL is a fast, production-ready Telegram bot for downloading media from **YouTube**, **Instagram**, and **SoundCloud**. Built with **aiogram 3**, **yt-dlp**, and **ffmpeg**.
+XinDL is a fast, production-ready Telegram bot for downloading media from **YouTube**, **Instagram**, and **SoundCloud
+**. Built with **aiogram 3**, **yt-dlp**, and **ffmpeg**.
 
 ---
 
@@ -8,12 +9,11 @@ XinDL is a fast, production-ready Telegram bot for downloading media from **YouT
 
 ### Supported platforms (only 3)
 
-| Platform | Content |
-|----------|---------|
-| **YouTube** | Videos, Shorts, music |
-| **Instagram** | Reels, posts, stories |
-| **SoundCloud** | Tracks (audio only) |
-
+| Platform       | Content               |
+|----------------|-----------------------|
+| **YouTube**    | Videos, Shorts, music |
+| **Instagram**  | Reels, posts, stories |
+| **SoundCloud** | Tracks (audio only)   |
 
 ### Quality selection (low → high)
 
@@ -82,6 +82,7 @@ docker compose up -d --build
 ```
 
 This starts:
+
 - `bot` — the Telegram downloader
 - `telegram-bot-api` — local API server for large file uploads
 
@@ -113,6 +114,7 @@ bash platform.sh
 ```
 
 Menu options:
+
 1. **Deploy / Update** — upload project + `docker compose up -d --build`
 2. **View Live Logs**
 3. **Check Docker Status**
@@ -129,6 +131,7 @@ Requires `sshpass` on your local machine.
 4. Wait for download + upload — file arrives in chat
 
 **Tips:**
+
 - Lower quality = faster download and smaller file
 - For very large videos, the bot splits and sends multiple parts automatically
 - Unsupported platforms get an immediate rejection message
@@ -137,15 +140,15 @@ Requires `sshpass` on your local machine.
 
 ## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BOT_TOKEN` | — | Telegram bot token from [@BotFather](https://t.me/BotFather) |
-| `USE_LOCAL_API` | `True` | Use local Bot API for >50 MB files |
-| `TELEGRAM_API_ID` | — | From my.telegram.org |
-| `TELEGRAM_API_HASH` | — | From my.telegram.org |
-| `MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |
-| `MAX_CONCURRENT_INFO` | `5` | Max parallel metadata fetches |
-| `YTDLP_TIMEOUT` | `300` | Timeout per download step (seconds) |
+| Variable                   | Default | Description                                                  |
+|----------------------------|---------|--------------------------------------------------------------|
+| `BOT_TOKEN`                | —       | Telegram bot token from [@BotFather](https://t.me/BotFather) |
+| `USE_LOCAL_API`            | `True`  | Use local Bot API for >50 MB files                           |
+| `TELEGRAM_API_ID`          | —       | From my.telegram.org                                         |
+| `TELEGRAM_API_HASH`        | —       | From my.telegram.org                                         |
+| `MAX_CONCURRENT_DOWNLOADS` | `3`     | Max parallel downloads                                       |
+| `MAX_CONCURRENT_INFO`      | `5`     | Max parallel metadata fetches                                |
+| `YTDLP_TIMEOUT`            | `300`   | Timeout per download step (seconds)                          |
 
 ---
 
@@ -164,6 +167,7 @@ src/
     ├── validator.py      # ffprobe validation + ffmpeg repair
     └── config.py         # Settings from .env
 ```
+
 ---
 
 ## Requirements

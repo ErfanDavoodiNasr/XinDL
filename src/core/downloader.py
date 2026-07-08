@@ -47,6 +47,7 @@ def _get_download_sem() -> asyncio.Semaphore:
     return _download_sem
 
 _info_cache = TTLCache(maxsize=200, ttl=3600)
+_cookies_copy_path: Optional[str] = None
 
 # Standard height tiers — offered only when source supports them (ascending)
 VIDEO_HEIGHT_TIERS = [144, 240, 360, 480, 720, 1080, 1440, 2160]
@@ -72,8 +73,21 @@ def is_valid_url(url: str) -> bool:
         return False
 
 def _video_fmt_string(height: int) -> str:
+    tiers = VIDEO_HEIGHT_TIERS
+    idx = tiers.index(height) if height in tiers else len(tiers) - 1
+    min_h = tiers[idx - 1] + 1 if idx > 0 else 0
+
+    if height <= 480:
+        return (
+            f"best[height<={height}][height>={min_h}][ext=mp4]/"
+            f"best[height<={height}][ext=mp4]/"
+            f"bestvideo[height<={height}][height>={min_h}]+bestaudio/"
+            f"bestvideo[height<={height}]+bestaudio/"
+            f"best[height<={height}]/best"
+        )
     return (
-        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}][height>={min_h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}][height>={min_h}]+bestaudio/"
         f"bestvideo[height<={height}]+bestaudio/"
         f"best[height<={height}]/best"
     )
@@ -130,6 +144,23 @@ def _is_audio_only(info: dict) -> bool:
         return (info.get('vcodec') or 'none') == 'none'
     return not any((f.get('vcodec') or 'none') != 'none' for f in formats)
 
+def _cookies_path() -> Optional[str]:
+    global _cookies_copy_path
+    src = settings.COOKIES_FILE
+    if not src or not os.path.isfile(src) or os.path.getsize(src) <= 64:
+        return None
+    if _cookies_copy_path and os.path.isfile(_cookies_copy_path):
+        return _cookies_copy_path
+    dest = os.path.join("data", "cookies.txt")
+    try:
+        shutil.copy2(src, dest)
+        _cookies_copy_path = dest
+        logger.debug(f"Using writable cookies copy: {dest}")
+        return dest
+    except OSError as e:
+        logger.warning(f"Could not copy cookies to writable path: {e}")
+        return None
+
 def _extract_max_height(info: dict) -> int:
     max_height = 0
     for f in info.get('formats', []) or []:
@@ -142,7 +173,7 @@ def _extract_max_height(info: dict) -> int:
     return max_height
 
 def _get_ydl_base_options() -> Dict[str, Any]:
-    return {
+    options: Dict[str, Any] = {
         'quiet': False,
         'no_warnings': False,
         'noplaylist': True,
@@ -150,14 +181,18 @@ def _get_ydl_base_options() -> Dict[str, Any]:
         'no_color': True,
         'cachedir': False,
         'logger': YTDLLogger(),
-        'concurrent_fragment_downloads': 3,
+        'concurrent_fragment_downloads': settings.YTDLP_FRAGMENT_CONCURRENCY,
         'retries': 3,
         'fragment_retries': 3,
         'socket_timeout': 30,
-        'extractor_args': {
-            'youtube': {'player_client': ['web', 'android', 'ios']},
-        },
+        'remote_components': ['ejs:github'],
     }
+    if settings.USE_COOKIES:
+        cookies = _cookies_path()
+        if cookies:
+            options['cookiefile'] = cookies
+            logger.debug(f"Using cookies file: {cookies}")
+    return options
 
 def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_callback=None) -> Dict[str, Any]:
     options = _get_ydl_base_options()
