@@ -4,14 +4,16 @@ import uuid
 import shutil
 import subprocess
 import yt_dlp
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional, Tuple, List
 import logging
 from src.core.config import settings
 from src.core.platforms import is_supported_url
 from src.core.validator import validate_and_prepare_media
 from src.core.exceptions import ValidationError
+from src.core.concurrency import dedupe_inflight
+from src.core.storage import ensure_download_space, cleanup_download_dir, remove_download_artifacts
 from urllib.parse import urlparse
-from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ DOWNLOAD_DIR = "downloads"
 # Separate semaphores: info fetch vs actual download (prevents pile-up on rapid links)
 _info_sem: Optional[asyncio.Semaphore] = None
 _download_sem: Optional[asyncio.Semaphore] = None
+_executor: Optional[ThreadPoolExecutor] = None
 
 def _get_info_sem() -> asyncio.Semaphore:
     global _info_sem
@@ -46,7 +49,22 @@ def _get_download_sem() -> asyncio.Semaphore:
         _download_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_DOWNLOADS)
     return _download_sem
 
-_info_cache = TTLCache(maxsize=200, ttl=3600)
+def _get_executor() -> ThreadPoolExecutor:
+    global _executor
+    if _executor is None:
+        _executor = ThreadPoolExecutor(
+            max_workers=settings.THREAD_POOL_WORKERS,
+            thread_name_prefix="ytdlp",
+        )
+    return _executor
+
+async def _run_blocking(func, timeout: Optional[int] = None):
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(_get_executor(), func),
+        timeout=timeout or settings.YTDLP_TIMEOUT,
+    )
+
 _cookies_copy_path: Optional[str] = None
 
 # Standard height tiers — offered only when source supports them (ascending)
@@ -227,6 +245,39 @@ def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_
 
     return options
 
+def _format_fallback_chain(format_id: str, is_audio: bool) -> List[str]:
+    """Progressively simpler yt-dlp format selectors when the first choice fails."""
+    if is_audio:
+        return ["bestaudio/best"]
+
+    chain: List[str] = []
+    video_cfg = _ALL_VIDEO.get(format_id)
+    if video_cfg:
+        chain.append(video_cfg["fmt"])
+
+    if format_id.endswith("p"):
+        try:
+            height = int(format_id.replace("p", ""))
+            for h in sorted(VIDEO_HEIGHT_TIERS, reverse=True):
+                if h < height:
+                    chain.append(f"best[height<={h}][ext=mp4]/best[height<={h}]/best")
+        except ValueError:
+            pass
+
+    chain.extend([
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "best[ext=mp4]/best",
+        "best",
+    ])
+
+    seen = set()
+    ordered: List[str] = []
+    for fmt in chain:
+        if fmt not in seen:
+            seen.add(fmt)
+            ordered.append(fmt)
+    return ordered
+
 def _get_media_duration(file_path: str) -> float:
     cmd = [
         'ffprobe', '-v', 'error',
@@ -287,52 +338,55 @@ async def fetch_info(url: str) -> Optional[Dict[str, Any]]:
         logger.warning(f"Rejected URL: {url[:80]}")
         return None
 
-    if url in _info_cache:
-        return _info_cache[url]
+    async def _fetch() -> Optional[Dict[str, Any]]:
+        def _extract():
+            ydl_opts = _get_ydl_base_options()
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    max_height = _extract_max_height(info)
+                    audio_only = _is_audio_only(info)
+                    final_video = [] if audio_only else build_video_formats(max_height)
+                    final_audio = build_audio_formats()
 
-    def _extract():
-        ydl_opts = _get_ydl_base_options()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                max_height = _extract_max_height(info)
-                audio_only = _is_audio_only(info)
-                final_video = [] if audio_only else build_video_formats(max_height)
-                final_audio = build_audio_formats()
+                    logger.info(
+                        f"fetch_info: url={url[:60]} max_h={max_height} "
+                        f"video_opts={len(final_video)} audio_opts={len(final_audio)}"
+                    )
 
-                logger.info(
-                    f"fetch_info: url={url[:60]} max_h={max_height} "
-                    f"video_opts={len(final_video)} audio_opts={len(final_audio)}"
-                )
-
-                return {
-                    "title": info.get('title', 'Unknown Title'),
-                    "thumbnail": info.get('thumbnail', ''),
-                    "duration": info.get('duration', 0),
-                    "max_height": max_height,
-                    "audio_only": audio_only,
-                    "formats": {
-                        "video": final_video,
-                        "audio": final_audio,
+                    return {
+                        "title": info.get('title', 'Unknown Title'),
+                        "thumbnail": info.get('thumbnail', ''),
+                        "duration": info.get('duration', 0),
+                        "max_height": max_height,
+                        "audio_only": audio_only,
+                        "formats": {
+                            "video": final_video,
+                            "audio": final_audio,
+                        }
                     }
-                }
-            except Exception as e:
-                logger.error(f"Error extracting info for {url}: {e}")
+                except Exception as e:
+                    logger.error(f"Error extracting info for {url}: {e}")
+                    return None
+
+        async with _get_info_sem():
+            try:
+                return await _run_blocking(_extract)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout extracting info for {url}")
                 return None
 
-    async with _get_info_sem():
-        try:
-            result = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=settings.YTDLP_TIMEOUT)
-            if result:
-                _info_cache[url] = result
-            return result
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout extracting info for {url}")
-            return None
+    return await dedupe_inflight(f"info:{url}", _fetch)
 
 async def download_media(url: str, format_id: str = 'best', is_audio: bool = False, progress_callback=None) -> Tuple[bool, str, str]:
     if not is_valid_url(url) or not is_supported_url(url):
         return False, "Unsupported platform.", ""
+
+    try:
+        ensure_download_space()
+    except OSError as exc:
+        logger.error("Insufficient disk space before download: %s", exc)
+        return False, "Server storage is full. Try again later or pick a lower quality.", ""
 
     file_id = str(uuid.uuid4())
     if is_audio:
@@ -341,34 +395,49 @@ async def download_media(url: str, format_id: str = 'best', is_audio: bool = Fal
         expected_final_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
 
     def _download() -> Tuple[bool, str, str]:
-        opts = _get_ydl_options(format_id, is_audio, expected_final_path, progress_callback=progress_callback)
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'Unknown Title')
-                actual = expected_final_path
-                if info.get('requested_downloads'):
-                    actual = info['requested_downloads'][0].get('filepath') or info['requested_downloads'][0].get('_filename') or actual
-                elif info.get('_filename'):
-                    actual = info['_filename']
-                actual_fmt = info.get('format') or info.get('format_id', 'unknown')
-                actual_h = info.get('height') or (info.get('requested_formats') or [{}])[0].get('height')
-                actual_w = info.get('width') or (info.get('requested_formats') or [{}])[0].get('width')
-                fsize = info.get('filesize') or info.get('filesize_approx')
-                logger.info(f"yt-dlp picked: fmt={actual_fmt} res={actual_w}x{actual_h} size={fsize} path={actual}")
-                return True, actual, title
-        except yt_dlp.utils.DownloadError as e:
-            logger.error(f"Download error for {url}: {e}")
-            return False, "Download failed or unsupported format for this URL.", ""
-        except Exception as e:
-            if str(e) == "DownloadCancelled":
-                raise e
-            logger.error(f"Unexpected error for {url}: {e}")
-            return False, "An unexpected error occurred.", ""
+        last_error: Optional[Exception] = None
+        for fmt in _format_fallback_chain(format_id, is_audio):
+            opts = _get_ydl_options(format_id, is_audio, expected_final_path, progress_callback=progress_callback)
+            opts['format'] = fmt
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    title = info.get('title', 'Unknown Title')
+                    actual = expected_final_path
+                    if info.get('requested_downloads'):
+                        actual = info['requested_downloads'][0].get('filepath') or info['requested_downloads'][0].get('_filename') or actual
+                    elif info.get('_filename'):
+                        actual = info['_filename']
+                    actual_fmt = info.get('format') or info.get('format_id', 'unknown')
+                    actual_h = info.get('height') or (info.get('requested_formats') or [{}])[0].get('height')
+                    actual_w = info.get('width') or (info.get('requested_formats') or [{}])[0].get('width')
+                    fsize = info.get('filesize') or info.get('filesize_approx')
+                    logger.info(
+                        f"yt-dlp picked: requested={format_id} used_fmt={fmt} "
+                        f"fmt={actual_fmt} res={actual_w}x{actual_h} size={fsize} path={actual}"
+                    )
+                    return True, actual, title
+            except yt_dlp.utils.DownloadError as e:
+                last_error = e
+                logger.warning(f"Download format failed for {url} | format={fmt} | error={e}")
+                remove_download_artifacts(file_id)
+            except Exception as e:
+                if str(e) == "DownloadCancelled":
+                    raise e
+                last_error = e
+                logger.error(f"Unexpected error for {url} with format {fmt}: {e}")
+                remove_download_artifacts(file_id)
+
+        if last_error:
+            logger.error(f"All format fallbacks failed for {url}: {last_error}")
+            err_text = str(last_error)
+            if "No space left on device" in err_text or "Errno 28" in err_text:
+                return False, "Server storage is full. Try again later or pick a lower quality.", ""
+        return False, "Download failed or unsupported format for this URL.", ""
 
     async with _get_download_sem():
         try:
-            success, path, title = await asyncio.wait_for(asyncio.to_thread(_download), timeout=settings.YTDLP_TIMEOUT)
+            success, path, title = await _run_blocking(_download)
 
             if success:
                 try:
@@ -381,11 +450,11 @@ async def download_media(url: str, format_id: str = 'best', is_audio: bool = Fal
             return success, path, title
         except asyncio.TimeoutError:
             logger.error(f"Download timeout for {url}")
-            if os.path.exists(expected_final_path):
-                os.remove(expected_final_path)
+            remove_download_artifacts(file_id)
             return False, "Download timed out.", ""
         except Exception as e:
             if str(e) == "DownloadCancelled":
                 raise e
             logger.error(f"Error during download for {url}: {e}")
+            remove_download_artifacts(file_id)
             return False, f"Download failed: {e}", ""

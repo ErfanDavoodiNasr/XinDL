@@ -120,6 +120,8 @@ DOCKERCFG
         export COMPOSE_DOCKER_CLI_BUILD=1
 
         cd "$PROJECT_DIR"
+        mkdir -p data/telegram-bot-api downloads
+        chmod -R 777 data/telegram-bot-api
 
         echo -e "${YELLOW}[*] Building and starting containers (host networking)...${NC}"
         docker compose up -d --build --remove-orphans
@@ -139,6 +141,12 @@ function view_status() {
     sshpass -p "$SERVER_PASSWORD" ssh -t $SSH_OPTS "$SERVER_USER@$SERVER_IP" "cd $PROJECT_DIR && docker compose ps && echo && docker compose logs --tail=20 bot"
 }
 
+case "${PLATFORM_ACTION:-}" in
+    deploy) deploy_bot; exit 0 ;;
+    logs) view_logs; exit 0 ;;
+    status) view_status; exit 0 ;;
+esac
+
 # Main Menu Loop
 while true; do
     echo -e "\n${BLUE}==========================================${NC}"
@@ -151,7 +159,10 @@ while true; do
     echo -e "3) 📊 Check Docker Status"
     echo -e "4) 🚪 Exit"
     echo -e "------------------------------------------"
-    read -p "Select an option [1-4]: " choice
+    if ! read -p "Select an option [1-4]: " choice; then
+        echo
+        exit 0
+    fi
 
     case $choice in
         1) deploy_bot ;;

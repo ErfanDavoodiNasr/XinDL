@@ -10,7 +10,14 @@ from src.bot.keyboards import (
     main_menu_keyboard
 )
 from src.core.downloader import download_media, fetch_info, split_large_file
+from src.core.storage import cleanup_download_dir, remove_download_artifacts
 from src.core.platforms import is_supported_url, unsupported_message, extract_url
+from src.core.concurrency import (
+    user_gate,
+    download_registry,
+    get_upload_sem,
+    get_background_sem,
+)
 import shutil
 from src.core.exceptions import ValidationError, RepairFailedError
 import os
@@ -62,6 +69,9 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(Command("help"))
 @router.message(F.text == "ℹ️ Help")
 async def cmd_help(message: Message, state: FSMContext):
+    user_id = getattr(message.from_user, "id", None)
+    if await user_gate.check_request(user_id, action="help"):
+        return
     await state.clear()
     await message.answer(get_help_text())
 
@@ -77,7 +87,13 @@ async def callback_new_dl(callback: CallbackQuery, state: FSMContext):
 
 # Handle URLs
 @router.message(F.text.regexp(r'https?://'))
-async def handle_url(message: Message, state: FSMContext):
+async def handle_url(message: Message, state: FSMContext, reference_id: str | None = None):
+    user_id = getattr(message.from_user, "id", None)
+    blocked = await user_gate.check_request(user_id)
+    if blocked:
+        await message.reply(blocked)
+        return
+
     url = extract_url(message.text or "")
     if not url:
         await message.reply("لینک معتبر پیدا نشد. یک لینک https:// بفرست.")
@@ -89,6 +105,7 @@ async def handle_url(message: Message, state: FSMContext):
         await message.reply(unsupported_message())
         return
 
+    cleanup_download_dir(max_age_seconds=0)
     msg = await message.reply("🔍 <i>Analyzing available qualities...</i>")
     
     # We await fetch_info directly here because it is fast (uses to_thread + caching)
@@ -103,7 +120,7 @@ async def handle_url(message: Message, state: FSMContext):
     acount = len(formats.get('audio', []))
     logger.info(f"fetch done | title={title[:40]} video_options={vcount} audio_options={acount}")
 
-    await state.update_data(url=url, msg_id=msg.message_id)
+    await state.update_data(url=url, msg_id=msg.message_id, reference_id=reference_id)
     await state.set_state(DownloadState.waiting_for_format)
 
     if vcount == 0 and acount > 0:
@@ -127,8 +144,10 @@ async def handle_non_link(message: Message, state: FSMContext):
 async def cancel_download(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     url = data.get("active_download_url")
+    user_id = getattr(callback.from_user, "id", None)
     if url:
         cancelled_downloads.add(url)
+    await user_gate.finish_download(user_id)
     
     await state.clear()
     await callback.message.edit_text("🛑 <b>Download Cancelled.</b>\n\nYou can send a new link whenever you're ready.")
@@ -150,13 +169,26 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     format_id = data_parts[2]
     
     is_audio = media_type == 'a'
+    user_id = getattr(callback.from_user, "id", None)
     
     data = await state.get_data()
     url = data.get("url")
+    ref_id = data.get("reference_id")
     
     if not url:
         await callback.answer("❌ Session expired. Please send the link again.", show_alert=True)
         await state.clear()
+        return
+
+    blocked = await user_gate.try_start_download(user_id)
+    if blocked:
+        await callback.answer(blocked, show_alert=True)
+        return
+
+    download_key = f"{url}|{format_id}|{'audio' if is_audio else 'video'}"
+    if not await download_registry.try_acquire(download_key):
+        await user_gate.finish_download(user_id)
+        await callback.answer("⏳ This quality is already downloading. Please wait.", show_alert=True)
         return
         
     await state.update_data(active_download_url=url)
@@ -182,16 +214,37 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     def _schedule_progress(text: str) -> None:
         asyncio.run_coroutine_threadsafe(_update_progress_ui(text), loop)
 
-    asyncio.create_task(_background_download_task(callback, url, format_id, is_audio, state, loop, _schedule_progress))
+    async def _run_download() -> None:
+        async with get_background_sem():
+            await _background_download_task(
+                callback, url, format_id, is_audio, state, loop, _schedule_progress,
+                ref_id=ref_id, user_id=user_id, download_key=download_key,
+            )
+
+    asyncio.create_task(_run_download())
     
     await callback.answer("Download started in background!", show_alert=False)
 
 
-async def _background_download_task(callback: CallbackQuery, url: str, format_id: str, is_audio: bool, state: FSMContext, loop: asyncio.AbstractEventLoop, schedule_progress):
+async def _background_download_task(
+    callback: CallbackQuery,
+    url: str,
+    format_id: str,
+    is_audio: bool,
+    state: FSMContext,
+    loop: asyncio.AbstractEventLoop,
+    schedule_progress,
+    ref_id: str | None = None,
+    user_id: int | None = None,
+    download_key: str | None = None,
+):
     from src.core.logger import reference_id_var
-    ref_id = reference_id_var.get()
+    token = None
+    if ref_id:
+        token = reference_id_var.set(ref_id)
     logger.info(f"Starting download for URL: {url} | Format: {format_id}")
     last_update_time = time.time()
+    file_prefix = ""
     
     def progress_hook(d):
         nonlocal last_update_time
@@ -229,30 +282,35 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
                 except Exception as e:
                     logger.warning(f"Error scheduling progress UI update: {e}")
 
+    result = None
     try:
-        success, result, title = await download_media(url, format_id=format_id, is_audio=is_audio, progress_callback=progress_hook)
-        
+        success, result, title = await download_media(
+            url, format_id=format_id, is_audio=is_audio, progress_callback=progress_hook
+        )
+        if success and result:
+            file_prefix = os.path.splitext(os.path.basename(result))[0]
+
         if url in cancelled_downloads:
             cancelled_downloads.remove(url)
             if result and os.path.exists(result):
                 os.remove(result)
             logger.info(f"Download cancelled by user after completion: {url}")
             return
-            
+
         await state.clear()
-        
+
         if not success:
             logger.error(f"Failed to download {url}: {result}")
             err_text = f"❌ <b>Error downloading:</b>\n{result}"
             if ref_id:
                 err_text += f"\n\n<i>Reference ID: {ref_id}</i>"
-                
+
             await callback.message.edit_text(
                 err_text,
                 reply_markup=post_download_keyboard()
             )
             return
-            
+
         file_size_bytes = os.path.getsize(result) if os.path.exists(result) else 0
         file_size_mb = file_size_bytes / (1024 * 1024)
         logger.info(f"Download successful: {url} | File: {result} | Size: {file_size_mb:.2f} MB")
@@ -261,93 +319,119 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         upload_timeout = _upload_timeout_seconds(file_size_bytes)
         safe_title = escape(title or 'media')
 
-        if file_size_bytes > MAX_PART_BYTES:
-            await callback.message.edit_text(f"✂️ <b>Splitting into ~2GB parts...</b>\n<i>Total size: {file_size_mb:.1f} MB</i>")
-            parts = split_large_file(result, MAX_PART_BYTES)
-            n = len(parts)
-            for i, part_path in enumerate(parts, 1):
-                p_size_mb = os.path.getsize(part_path) / (1024 * 1024)
-                part_cap = (
+        async with get_upload_sem():
+            if file_size_bytes > MAX_PART_BYTES:
+                await callback.message.edit_text(
+                    f"✂️ <b>Splitting into ~2GB parts...</b>\n<i>Total size: {file_size_mb:.1f} MB</i>"
+                )
+                parts = split_large_file(result, MAX_PART_BYTES)
+                n = len(parts)
+                for i, part_path in enumerate(parts, 1):
+                    p_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                    part_cap = (
+                        f"🎥 <b>{safe_title}</b>\n\n"
+                        f"📊 Part {i}/{n} | Size: {p_size_mb:.1f} MB\n"
+                        f"⚙️ Quality: {format_id}\n\n"
+                        f"⚡️ <i>Downloaded via @XinDL</i>"
+                    )
+                    part_uri = f"file://{os.path.abspath(part_path)}"
+                    if not is_audio:
+                        await callback.message.bot.send_chat_action(
+                            chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO
+                        )
+                        await callback.message.answer_video(
+                            video=part_uri, caption=part_cap, request_timeout=upload_timeout
+                        )
+                    else:
+                        await callback.message.bot.send_chat_action(
+                            chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT
+                        )
+                        await callback.message.answer_audio(
+                            audio=part_uri, caption=part_cap, request_timeout=upload_timeout
+                        )
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                try:
+                    parts_dir = result + "_parts"
+                    if os.path.isdir(parts_dir):
+                        shutil.rmtree(parts_dir, ignore_errors=True)
+                except OSError:
+                    pass
+                try:
+                    os.remove(result)
+                    result = None
+                except OSError:
+                    pass
+                logger.info(f"Sent {n} parts for large file {url}")
+            else:
+                await callback.message.edit_text(
+                    f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>"
+                )
+                caption = (
                     f"🎥 <b>{safe_title}</b>\n\n"
-                    f"📊 Part {i}/{n} | Size: {p_size_mb:.1f} MB\n"
-                    f"⚙️ Quality: {format_id}\n\n"
+                    f"📊 <b>Size:</b> {file_size_mb:.2f} MB\n"
+                    f"⚙️ <b>Quality:</b> {format_id}\n\n"
                     f"⚡️ <i>Downloaded via @XinDL</i>"
                 )
-                part_uri = f"file://{os.path.abspath(part_path)}"
+                local_uri = f"file://{os.path.abspath(result)}"
                 if not is_audio:
-                    await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-                    await callback.message.answer_video(video=part_uri, caption=part_cap, request_timeout=upload_timeout)
+                    await callback.message.bot.send_chat_action(
+                        chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO
+                    )
+                    await callback.message.answer_video(
+                        video=local_uri, caption=caption, request_timeout=upload_timeout
+                    )
                 else:
-                    await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                    await callback.message.answer_audio(audio=part_uri, caption=part_cap, request_timeout=upload_timeout)
-                try:
-                    os.remove(part_path)
-                except:
-                    pass
-            # cleanup parts dir and original
-            try:
-                parts_dir = result + "_parts"
-                if os.path.isdir(parts_dir):
-                    shutil.rmtree(parts_dir, ignore_errors=True)
-            except:
-                pass
-            try:
-                os.remove(result)
-            except:
-                pass
-            logger.info(f"Sent {n} parts for large file {url}")
-        else:
-            await callback.message.edit_text(f"📤 <b>Uploading to Telegram...</b>\n<i>Size: {file_size_mb:.2f} MB</i>")
-            caption = (
-                f"🎥 <b>{safe_title}</b>\n\n"
-                f"📊 <b>Size:</b> {file_size_mb:.2f} MB\n"
-                f"⚙️ <b>Quality:</b> {format_id}\n\n"
-                f"⚡️ <i>Downloaded via @XinDL</i>"
-            )
-            local_uri = f"file://{os.path.abspath(result)}"
-            if not is_audio:
-                await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-                await callback.message.answer_video(video=local_uri, caption=caption, request_timeout=upload_timeout)
-            else:
-                await callback.message.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                await callback.message.answer_audio(audio=local_uri, caption=caption, request_timeout=upload_timeout)
-            logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
-        
+                    await callback.message.bot.send_chat_action(
+                        chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT
+                    )
+                    await callback.message.answer_audio(
+                        audio=local_uri, caption=caption, request_timeout=upload_timeout
+                    )
+                logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
+
         try:
             await callback.message.delete()
         except Exception:
             pass
-            
+
         await callback.message.answer(
-            "✅ <b>Download Complete!</b>\n\nWhat would you like to do next?", 
+            "✅ <b>Download Complete!</b>\n\nWhat would you like to do next?",
             reply_markup=post_download_keyboard()
         )
-            
+
     except TelegramRetryAfter as e:
         logger.warning(f"Rate limited by Telegram. Retry after {e.retry_after}")
-        await callback.message.edit_text(f"❌ Rate limited by Telegram. Please try again after {e.retry_after} seconds.")
+        await callback.message.edit_text(
+            f"❌ Rate limited by Telegram. Please try again after {e.retry_after} seconds."
+        )
     except Exception as e:
         if str(e) == "DownloadCancelled":
             if url in cancelled_downloads:
                 cancelled_downloads.remove(url)
             logger.info(f"Download cancelled by user: {url}")
             return
-            
+
         if isinstance(e, ValidationError):
             logger.warning(f"Validation Error caught for {url}: {e.message}")
             err_msg = f"❌ <b>Validation Failed:</b>\n{e.message}"
             if ref_id:
                 err_msg += f"\n\n<i>Reference ID: {ref_id}</i>"
-                
+
             if getattr(e, 'fallback_suggested', False) and not is_audio:
-                err_msg += "\n\n💡 <i>The video is corrupted. Please tap 'Download Another' and try the Audio Only option.</i>"
-                
+                err_msg += (
+                    "\n\n💡 <i>The video is corrupted. Please tap 'Download Another' "
+                    "and try the Audio Only option.</i>"
+                )
+
             try:
                 await callback.message.edit_text(err_msg, reply_markup=post_download_keyboard())
             except Exception:
                 pass
             return
-            
+
         logger.exception(f"Unexpected error in background download task for {url}: {e}")
         err_msg = "❌ An unexpected error occurred."
         if ref_id:
@@ -357,10 +441,17 @@ async def _background_download_task(callback: CallbackQuery, url: str, format_id
         except Exception:
             pass
     finally:
-        # Cleanup
+        if download_key:
+            await download_registry.release(download_key)
+        await user_gate.finish_download(user_id)
+        if token is not None:
+            reference_id_var.reset(token)
         try:
-            if 'result' in locals() and result and os.path.exists(result):
+            if result and os.path.exists(result):
                 os.remove(result)
                 logger.info(f"Cleaned up file: {result}")
         except Exception as e:
             logger.error(f"Failed to remove file: {e}")
+        if file_prefix:
+            remove_download_artifacts(file_prefix)
+        cleanup_download_dir(max_age_seconds=0)

@@ -19,6 +19,7 @@ class RequestContextMiddleware(BaseMiddleware):
         
         # Set the context variable for the logger
         token = reference_id_var.set(ref_id)
+        data["reference_id"] = ref_id
         
         try:
             return await handler(event, data)
