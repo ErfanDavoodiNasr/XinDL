@@ -7,6 +7,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from src.core.config import settings
+from src.core.resources import runtime
 from src.bot.handlers import router
 from src.core.logger import setup_logger
 from src.core.storage import cleanup_download_dir
@@ -45,7 +46,7 @@ async def wait_for_local_api() -> None:
 
 async def main():
     logger.info("Starting Telegram Bot...")
-    cleanup_download_dir(max_age_seconds=0)
+    cleanup_download_dir(max_age_seconds=runtime.DOWNLOAD_CLEANUP_AGE_SECONDS)
     if settings.BOT_TOKEN == "your_telegram_bot_token_here":
         logger.error("BOT_TOKEN is not set in environment variables! Please set it in .env")
         return
@@ -60,7 +61,8 @@ async def main():
     if settings.USE_LOCAL_API:
         logger.info("Configuring Bot to use Local Telegram API Server...")
         session = AiohttpSession(
-            api=TelegramAPIServer.from_base(settings.TELEGRAM_LOCAL_API_URL, is_local=True)
+            api=TelegramAPIServer.from_base(settings.TELEGRAM_LOCAL_API_URL, is_local=True),
+            timeout=10800,
         )
         bot = Bot(
             token=settings.BOT_TOKEN,

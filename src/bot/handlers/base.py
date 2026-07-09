@@ -12,6 +12,10 @@ from src.bot.keyboards import (
 from src.core.downloader import download_media, fetch_info, split_large_file
 from src.core.storage import cleanup_download_dir, remove_download_artifacts
 from src.core.platforms import is_supported_url, unsupported_message, extract_url
+from src.core.url_utils import normalize_url
+from src.core.session_cache import create_session, get_session
+from src.core.validator import get_media_metadata
+from src.core.resources import runtime
 from src.core.concurrency import (
     user_gate,
     download_registry,
@@ -27,6 +31,7 @@ import asyncio
 import re
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.enums import ChatAction
+from aiogram.methods import SendAudio, SendVideo
 from html import escape
 
 logger = logging.getLogger(__name__)
@@ -96,8 +101,10 @@ async def handle_url(message: Message, state: FSMContext, reference_id: str | No
 
     url = extract_url(message.text or "")
     if not url:
-        await message.reply("لینک معتبر پیدا نشد. یک لینک https:// بفرست.")
+        await message.reply("No valid link found. Please send an https:// URL.")
         return
+
+    url = normalize_url(url)
 
     logger.info(f"URL received | chat={message.chat.id} user={getattr(message.from_user, 'id', None)} url={url[:70]}")
 
@@ -105,29 +112,51 @@ async def handle_url(message: Message, state: FSMContext, reference_id: str | No
         await message.reply(unsupported_message())
         return
 
-    cleanup_download_dir(max_age_seconds=0)
+    cleanup_download_dir(max_age_seconds=runtime.DOWNLOAD_CLEANUP_AGE_SECONDS)
     msg = await message.reply("🔍 <i>Analyzing available qualities...</i>")
     
     # We await fetch_info directly here because it is fast (uses to_thread + caching)
-    info = await fetch_info(url)
+    info, fetch_error = await fetch_info(url)
     if not info:
-        await msg.edit_text("❌ <i>Could not extract information.</i> Please ensure it's a valid, public media link.")
+        detail = fetch_error or (
+            "Please ensure it's a valid, public media link. Some SoundCloud tracks are "
+            "preview-only (30s) or DRM-protected and cannot be fully downloaded."
+        )
+        await msg.edit_text(f"❌ <i>Could not extract information.</i>\n\n{detail}")
         return
 
     title = escape(info.get('title', 'Unknown Title') or 'Unknown Title')
     formats = info.get('formats', {})
     vcount = len(formats.get('video', []))
     acount = len(formats.get('audio', []))
+    duration = info.get('duration') or 0
+    preview_only = info.get('preview_only', False)
     logger.info(f"fetch done | title={title[:40]} video_options={vcount} audio_options={acount}")
 
-    await state.update_data(url=url, msg_id=msg.message_id, reference_id=reference_id)
+    session_id = create_session(
+        url=url,
+        title=info.get('title', 'Unknown Title') or 'Unknown Title',
+        formats=formats,
+        reference_id=reference_id,
+        duration=duration,
+        preview_only=preview_only,
+    )
+
+    await state.update_data(url=url, msg_id=msg.message_id, reference_id=reference_id, session_id=session_id)
     await state.set_state(DownloadState.waiting_for_format)
 
-    if vcount == 0 and acount > 0:
+    if preview_only:
+        text = (
+            f"⚠️ <b>{title}</b>\n\n"
+            f"This SoundCloud track is only available as a <b>~30 second preview</b>. "
+            f"The full version requires a SoundCloud Go account.\n\n"
+            f"👇 <i>You can still download the preview below:</i>"
+        )
+    elif vcount == 0 and acount > 0:
         text = f"🎵 <b>{title}</b>\n\n👇 <i>Audio only — choose quality (low → high):</i>"
     else:
         text = f"🎥 <b>{title}</b>\n\n👇 <i>Choose quality (low → high):</i>"
-    await msg.edit_text(text, reply_markup=download_format_keyboard(formats))
+    await msg.edit_text(text, reply_markup=download_format_keyboard(formats, session_id))
 
 @router.callback_query(F.data == "ignore")
 async def ignore_callback(callback: CallbackQuery):
@@ -138,7 +167,9 @@ async def ignore_callback(callback: CallbackQuery):
 async def handle_non_link(message: Message, state: FSMContext):
     if message.text.strip() in ("ℹ️ Help",) or message.text.startswith("/"):
         return
-    await message.reply("فقط YouTube، Instagram و SoundCloud ساپورت می‌شن. لینک مستقیم بفرست.")
+    await message.reply(
+        "Only YouTube, Instagram, and SoundCloud are supported. Please send a direct link."
+    )
 
 @router.callback_query(F.data == "cancel_dl")
 async def cancel_download(callback: CallbackQuery, state: FSMContext):
@@ -160,21 +191,81 @@ def build_progress_bar(percent: float) -> str:
 
 def _upload_timeout_seconds(file_size_bytes: int) -> int:
     size_mb = file_size_bytes / (1024 * 1024)
-    return max(120, int(size_mb * 3))
+    # ~5s per MB + 3 min floor; large local-API uploads need headroom.
+    return max(180, int(size_mb * 5) + 120)
 
-@router.callback_query(F.data.startswith("dl_"), DownloadState.waiting_for_format)
+
+def _parse_download_callback(data: str) -> tuple[str, str, str] | None:
+    """Parse dl:v:720p:sessionid or legacy dl_v_720p."""
+    if data.startswith("dl:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            return parts[1], parts[2], parts[3]
+        return None
+    if data.startswith("dl_"):
+        legacy = data.split("_", 2)
+        if len(legacy) == 3:
+            return legacy[1], legacy[2], ""
+    return None
+
+
+async def _send_video_file(message, file_uri: str, caption: str, upload_timeout: int) -> None:
+    file_path = file_uri[7:] if file_uri.startswith("file://") else file_uri
+    meta = await get_media_metadata(file_path)
+    method_kwargs: dict = {
+        "chat_id": message.chat.id,
+        "video": file_uri,
+        "caption": caption,
+        "supports_streaming": True,
+    }
+    if meta.get("width"):
+        method_kwargs["width"] = meta["width"]
+    if meta.get("height"):
+        method_kwargs["height"] = meta["height"]
+    if meta.get("duration"):
+        method_kwargs["duration"] = meta["duration"]
+    await message.bot(SendVideo(**method_kwargs), request_timeout=upload_timeout)
+
+
+async def _send_audio_file(message, file_uri: str, caption: str, upload_timeout: int) -> None:
+    await message.bot(
+        SendAudio(chat_id=message.chat.id, audio=file_uri, caption=caption),
+        request_timeout=upload_timeout,
+    )
+
+
+@router.callback_query(F.data.startswith("dl:") | F.data.startswith("dl_"))
 async def process_download(callback: CallbackQuery, state: FSMContext):
-    data_parts = callback.data.split("_", 2)
-    media_type = data_parts[1]
-    format_id = data_parts[2]
-    
+    parsed = _parse_download_callback(callback.data)
+    if not parsed:
+        await callback.answer("Invalid selection.", show_alert=True)
+        return
+
+    media_type, format_id, session_id = parsed
     is_audio = media_type == 'a'
     user_id = getattr(callback.from_user, "id", None)
-    
-    data = await state.get_data()
-    url = data.get("url")
-    ref_id = data.get("reference_id")
-    
+
+    url = None
+    ref_id = None
+    expected_duration = 0.0
+
+    if session_id:
+        session = get_session(session_id)
+        if session:
+            url = session.url
+            ref_id = session.reference_id
+            expected_duration = session.duration or 0.0
+        else:
+            await callback.answer(
+                "❌ Session expired (24h limit). Please send the link again.",
+                show_alert=True,
+            )
+            return
+    else:
+        data = await state.get_data()
+        url = data.get("url")
+        ref_id = data.get("reference_id")
+
     if not url:
         await callback.answer("❌ Session expired. Please send the link again.", show_alert=True)
         await state.clear()
@@ -219,6 +310,7 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             await _background_download_task(
                 callback, url, format_id, is_audio, state, loop, _schedule_progress,
                 ref_id=ref_id, user_id=user_id, download_key=download_key,
+                expected_duration=expected_duration,
             )
 
     asyncio.create_task(_run_download())
@@ -237,6 +329,7 @@ async def _background_download_task(
     ref_id: str | None = None,
     user_id: int | None = None,
     download_key: str | None = None,
+    expected_duration: float = 0.0,
 ):
     from src.core.logger import reference_id_var
     token = None
@@ -285,7 +378,9 @@ async def _background_download_task(
     result = None
     try:
         success, result, title = await download_media(
-            url, format_id=format_id, is_audio=is_audio, progress_callback=progress_hook
+            url, format_id=format_id, is_audio=is_audio,
+            progress_callback=progress_hook,
+            expected_duration=expected_duration,
         )
         if success and result:
             file_prefix = os.path.splitext(os.path.basename(result))[0]
@@ -327,7 +422,9 @@ async def _background_download_task(
                 parts = split_large_file(result, MAX_PART_BYTES)
                 n = len(parts)
                 for i, part_path in enumerate(parts, 1):
-                    p_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                    p_size_bytes = os.path.getsize(part_path)
+                    p_size_mb = p_size_bytes / (1024 * 1024)
+                    part_timeout = _upload_timeout_seconds(p_size_bytes)
                     part_cap = (
                         f"🎥 <b>{safe_title}</b>\n\n"
                         f"📊 Part {i}/{n} | Size: {p_size_mb:.1f} MB\n"
@@ -339,15 +436,15 @@ async def _background_download_task(
                         await callback.message.bot.send_chat_action(
                             chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO
                         )
-                        await callback.message.answer_video(
-                            video=part_uri, caption=part_cap, request_timeout=upload_timeout
+                        await _send_video_file(
+                            callback.message, part_uri, part_cap, part_timeout
                         )
                     else:
                         await callback.message.bot.send_chat_action(
-                            chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT
+                            chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VOICE
                         )
-                        await callback.message.answer_audio(
-                            audio=part_uri, caption=part_cap, request_timeout=upload_timeout
+                        await _send_audio_file(
+                            callback.message, part_uri, part_cap, part_timeout
                         )
                     try:
                         os.remove(part_path)
@@ -380,15 +477,15 @@ async def _background_download_task(
                     await callback.message.bot.send_chat_action(
                         chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VIDEO
                     )
-                    await callback.message.answer_video(
-                        video=local_uri, caption=caption, request_timeout=upload_timeout
+                    await _send_video_file(
+                        callback.message, local_uri, caption, upload_timeout
                     )
                 else:
                     await callback.message.bot.send_chat_action(
-                        chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_DOCUMENT
+                        chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VOICE
                     )
-                    await callback.message.answer_audio(
-                        audio=local_uri, caption=caption, request_timeout=upload_timeout
+                    await _send_audio_file(
+                        callback.message, local_uri, caption, upload_timeout
                     )
                 logger.info(f"Successfully sent {result} to chat {callback.message.chat.id}")
 
@@ -454,4 +551,4 @@ async def _background_download_task(
             logger.error(f"Failed to remove file: {e}")
         if file_prefix:
             remove_download_artifacts(file_prefix)
-        cleanup_download_dir(max_age_seconds=0)
+        cleanup_download_dir(max_age_seconds=runtime.DOWNLOAD_CLEANUP_AGE_SECONDS)

@@ -17,7 +17,7 @@ services:
         limits:
           cpus: '0.5'
           memory: 256M
-    entrypoint: ["/bin/sh", "-c"]
+    entrypoint: [ "/bin/sh", "-c" ]
     command:
       - |
         mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api
@@ -33,7 +33,7 @@ services:
           --dir=/var/lib/telegram-bot-api \
           --temp-dir=/tmp/telegram-bot-api
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8081"]
+      test: [ "CMD-SHELL", "nc -z 127.0.0.1 8081" ]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -52,7 +52,6 @@ services:
       - .env
     environment:
       TELEGRAM_LOCAL_API_URL: http://127.0.0.1:8081
-      AUTO_TUNE_RESOURCES: "true"
     volumes:
       - downloads_data:/app/downloads
       - ./cookies:/app/cookies

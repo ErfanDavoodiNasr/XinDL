@@ -1,12 +1,31 @@
-"""Detect host resources and derive safe concurrency defaults."""
+"""Detect host resources and derive all runtime performance limits automatically."""
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RuntimeLimits:
+    MAX_CONCURRENT_DOWNLOADS: int
+    MAX_CONCURRENT_INFO: int
+    MAX_CONCURRENT_UPLOADS: int
+    MAX_BACKGROUND_TASKS: int
+    THREAD_POOL_WORKERS: int
+    USER_RATE_LIMIT_PER_MINUTE: int
+    USER_MAX_ACTIVE_DOWNLOADS: int
+    YTDLP_FRAGMENT_CONCURRENCY: int
+    YTDLP_TIMEOUT: int
+    SESSION_TTL_SECONDS: int
+    SESSION_CACHE_MAX_SIZE: int
+    INFO_CACHE_TTL_SECONDS: int
+    INFO_CACHE_MAX_SIZE: int
+    DOWNLOAD_CLEANUP_AGE_SECONDS: int
 
 
 def _read_int_file(path: Path) -> Optional[int]:
@@ -66,74 +85,109 @@ def detect_cpu_count() -> float:
     return float(cpu_count)
 
 
-def compute_concurrency_limits(
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def compute_runtime_limits(
     memory_bytes: Optional[int] = None,
     cpu_count: Optional[float] = None,
-) -> Dict[str, int]:
-    """Scale worker limits to available RAM and CPU."""
+) -> RuntimeLimits:
+    """
+    Scale every performance knob from detected RAM and CPU.
+
+    Info/metadata work is lightweight — we bias toward higher info concurrency
+    for snappy button responses. Heavy download/upload work is capped by memory.
+    """
     mem = memory_bytes if memory_bytes is not None else detect_memory_bytes()
     cpu = cpu_count if cpu_count is not None else detect_cpu_count()
     mem_gb = mem / (1024 ** 3)
 
+    # Metadata fetches are cheap — prioritize responsiveness.
+    info = _clamp(int(cpu * 5 + mem_gb * 4), 3, 16)
+    downloads = _clamp(int(cpu * 1.5 + mem_gb * 0.75), 1, 6)
+    uploads = _clamp(int(cpu * 0.75 + 0.5), 1, 4)
+    fragments = _clamp(int(cpu * 4 + mem_gb * 3), 2, 16)
+    thread_pool = _clamp(downloads + info // 2 + 1, 2, 12)
+    background = _clamp(info + downloads + uploads + 2, 6, 24)
+    rate_limit = _clamp(int(cpu * 40 + mem_gb * 30), 30, 200)
+    user_active = _clamp(int(cpu + 0.5), 1, 4)
+    ytdlp_timeout = _clamp(int(300 + mem_gb * 180), 300, 1800)
+
+    # Tighten on very small hosts so OOM is unlikely.
     if mem_gb <= 1.25:
-        base = {
-            "MAX_CONCURRENT_DOWNLOADS": 1,
-            "MAX_CONCURRENT_INFO": 2,
-            "YTDLP_FRAGMENT_CONCURRENCY": 2,
-            "MAX_CONCURRENT_UPLOADS": 1,
-            "MAX_BACKGROUND_TASKS": 3,
-            "THREAD_POOL_WORKERS": 2,
-            "USER_RATE_LIMIT_PER_MINUTE": 10,
-            "USER_MAX_ACTIVE_DOWNLOADS": 1,
-        }
+        downloads = 1
+        uploads = 1
+        fragments = min(fragments, 4)
+        thread_pool = min(thread_pool, 4)
+        background = min(background, 8)
+        user_active = 1
     elif mem_gb <= 2.5:
-        base = {
-            "MAX_CONCURRENT_DOWNLOADS": 2,
-            "MAX_CONCURRENT_INFO": 3,
-            "YTDLP_FRAGMENT_CONCURRENCY": 4,
-            "MAX_CONCURRENT_UPLOADS": 2,
-            "MAX_BACKGROUND_TASKS": 6,
-            "THREAD_POOL_WORKERS": 3,
-            "USER_RATE_LIMIT_PER_MINUTE": 20,
-            "USER_MAX_ACTIVE_DOWNLOADS": 2,
-        }
-    elif mem_gb <= 4.0:
-        base = {
-            "MAX_CONCURRENT_DOWNLOADS": 3,
-            "MAX_CONCURRENT_INFO": 4,
-            "YTDLP_FRAGMENT_CONCURRENCY": 6,
-            "MAX_CONCURRENT_UPLOADS": 2,
-            "MAX_BACKGROUND_TASKS": 8,
-            "THREAD_POOL_WORKERS": 4,
-            "USER_RATE_LIMIT_PER_MINUTE": 30,
-            "USER_MAX_ACTIVE_DOWNLOADS": 2,
-        }
-    else:
-        base = {
-            "MAX_CONCURRENT_DOWNLOADS": 4,
-            "MAX_CONCURRENT_INFO": 6,
-            "YTDLP_FRAGMENT_CONCURRENCY": 8,
-            "MAX_CONCURRENT_UPLOADS": 3,
-            "MAX_BACKGROUND_TASKS": 12,
-            "THREAD_POOL_WORKERS": 6,
-            "USER_RATE_LIMIT_PER_MINUTE": 40,
-            "USER_MAX_ACTIVE_DOWNLOADS": 3,
-        }
+        downloads = min(downloads, 2)
+        fragments = min(fragments, 8)
+        thread_pool = min(thread_pool, 6)
 
     if cpu <= 1.0:
-        base["MAX_CONCURRENT_DOWNLOADS"] = min(base["MAX_CONCURRENT_DOWNLOADS"], 1)
-        base["YTDLP_FRAGMENT_CONCURRENCY"] = min(base["YTDLP_FRAGMENT_CONCURRENCY"], 2)
-        base["THREAD_POOL_WORKERS"] = min(base["THREAD_POOL_WORKERS"], 2)
+        downloads = min(downloads, 1)
+        fragments = min(fragments, 4)
+        thread_pool = min(thread_pool, 4)
     elif cpu <= 2.0:
-        base["MAX_CONCURRENT_DOWNLOADS"] = min(base["MAX_CONCURRENT_DOWNLOADS"], 2)
-        base["YTDLP_FRAGMENT_CONCURRENCY"] = min(base["YTDLP_FRAGMENT_CONCURRENCY"], 4)
+        downloads = min(downloads, 2)
+
+    session_cache = _clamp(int(mem_gb * 400 + cpu * 100), 500, 5000)
+    info_cache = _clamp(int(mem_gb * 100 + cpu * 50), 200, 2000)
+    cleanup_age = _clamp(int(900 + mem_gb * 300), 900, 3600)
+
+    limits = RuntimeLimits(
+        MAX_CONCURRENT_DOWNLOADS=downloads,
+        MAX_CONCURRENT_INFO=info,
+        MAX_CONCURRENT_UPLOADS=uploads,
+        MAX_BACKGROUND_TASKS=background,
+        THREAD_POOL_WORKERS=thread_pool,
+        USER_RATE_LIMIT_PER_MINUTE=rate_limit,
+        USER_MAX_ACTIVE_DOWNLOADS=user_active,
+        YTDLP_FRAGMENT_CONCURRENCY=fragments,
+        YTDLP_TIMEOUT=ytdlp_timeout,
+        SESSION_TTL_SECONDS=86400,
+        SESSION_CACHE_MAX_SIZE=session_cache,
+        INFO_CACHE_TTL_SECONDS=3600,
+        INFO_CACHE_MAX_SIZE=info_cache,
+        DOWNLOAD_CLEANUP_AGE_SECONDS=cleanup_age,
+    )
 
     logger.info(
-        "Auto-tuned concurrency | mem_gb=%.2f cpu=%.1f downloads=%s info=%s fragments=%s",
+        "Auto-tuned runtime | mem_gb=%.2f cpu=%.1f "
+        "downloads=%s info=%s uploads=%s background=%s threads=%s fragments=%s timeout=%ss",
         mem_gb,
         cpu,
-        base["MAX_CONCURRENT_DOWNLOADS"],
-        base["MAX_CONCURRENT_INFO"],
-        base["YTDLP_FRAGMENT_CONCURRENCY"],
+        limits.MAX_CONCURRENT_DOWNLOADS,
+        limits.MAX_CONCURRENT_INFO,
+        limits.MAX_CONCURRENT_UPLOADS,
+        limits.MAX_BACKGROUND_TASKS,
+        limits.THREAD_POOL_WORKERS,
+        limits.YTDLP_FRAGMENT_CONCURRENCY,
+        limits.YTDLP_TIMEOUT,
     )
-    return base
+    return limits
+
+
+# Singleton computed once at import — no manual .env tuning required.
+runtime = compute_runtime_limits()
+
+
+# Backward-compatible alias used by tests.
+def compute_concurrency_limits(
+    memory_bytes: Optional[int] = None,
+    cpu_count: Optional[float] = None,
+) -> Dict[str, int]:
+    limits = compute_runtime_limits(memory_bytes, cpu_count)
+    return {
+        "MAX_CONCURRENT_DOWNLOADS": limits.MAX_CONCURRENT_DOWNLOADS,
+        "MAX_CONCURRENT_INFO": limits.MAX_CONCURRENT_INFO,
+        "MAX_CONCURRENT_UPLOADS": limits.MAX_CONCURRENT_UPLOADS,
+        "MAX_BACKGROUND_TASKS": limits.MAX_BACKGROUND_TASKS,
+        "THREAD_POOL_WORKERS": limits.THREAD_POOL_WORKERS,
+        "USER_RATE_LIMIT_PER_MINUTE": limits.USER_RATE_LIMIT_PER_MINUTE,
+        "USER_MAX_ACTIVE_DOWNLOADS": limits.USER_MAX_ACTIVE_DOWNLOADS,
+        "YTDLP_FRAGMENT_CONCURRENCY": limits.YTDLP_FRAGMENT_CONCURRENCY,
+    }

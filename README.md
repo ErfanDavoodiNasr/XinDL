@@ -31,9 +31,8 @@ XinDL is a fast, production-ready Telegram bot for downloading media from **YouT
 
 ### Performance & concurrency
 
-- Separate limits for info fetch and download (no slowdown on rapid requests)
-- `MAX_CONCURRENT_INFO=5` — parallel metadata extraction
-- `MAX_CONCURRENT_DOWNLOADS=3` — parallel downloads
+- All concurrency limits are **auto-tuned at startup** from detected RAM and CPU
+- Separate limits for info fetch and download (snappy quality menus even under load)
 - In-memory TTL cache for repeated URLs (1 hour)
 - Live progress bar during download (speed, ETA, percent)
 
@@ -146,9 +145,8 @@ Requires `sshpass` on your local machine.
 | `USE_LOCAL_API`            | `True`  | Use local Bot API for >50 MB files                           |
 | `TELEGRAM_API_ID`          | —       | From my.telegram.org                                         |
 | `TELEGRAM_API_HASH`        | —       | From my.telegram.org                                         |
-| `MAX_CONCURRENT_DOWNLOADS` | `3`     | Max parallel downloads                                       |
-| `MAX_CONCURRENT_INFO`      | `5`     | Max parallel metadata fetches                                |
-| `YTDLP_TIMEOUT`            | `300`   | Timeout per download step (seconds)                          |
+
+Concurrency, timeouts, cache sizes, and rate limits are computed automatically from host resources at startup (see `src/core/resources.py`).
 
 ---
 

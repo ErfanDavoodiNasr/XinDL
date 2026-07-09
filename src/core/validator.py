@@ -107,7 +107,11 @@ async def _attempt_repair(file_path: str, is_audio: bool) -> str:
         
     raise RepairFailedError(f"Automated repair failed entirely. stderr: {stderr}")
 
-async def validate_and_prepare_media(file_path: str, is_audio: bool) -> str:
+async def validate_and_prepare_media(
+    file_path: str,
+    is_audio: bool,
+    expected_duration: float = 0.0,
+) -> str:
     """
     Validates media deeply. If it fails, attempts repair.
     Throws ValidationError if the media is unsalvageable.
@@ -127,6 +131,12 @@ async def validate_and_prepare_media(file_path: str, is_audio: bool) -> str:
         duration = float(metadata.get('format', {}).get('duration', 0))
         if duration <= 0:
             raise ValidationError("File has zero or missing duration.")
+
+        if expected_duration > 45 and duration < expected_duration * 0.85:
+            raise ValidationError(
+                f"Download appears truncated ({int(duration)}s of ~{int(expected_duration)}s). "
+                "This track may be preview-only or region-locked on SoundCloud."
+            )
             
         streams = metadata.get('streams', [])
         has_video = any(s.get('codec_type') == 'video' for s in streams)
@@ -176,3 +186,54 @@ async def validate_and_prepare_media(file_path: str, is_audio: bool) -> str:
     except Exception as e:
         logger.error(f"Unexpected validation error: {e}")
         raise ValidationError(f"Unexpected validation error: {e}")
+
+
+def _needs_faststart(file_path: str) -> bool:
+    """Return True when moov atom is after mdat (not streamable in Telegram)."""
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(1_000_000)
+        moov = head.find(b"moov")
+        mdat = head.find(b"mdat")
+        if moov < 0 or mdat < 0:
+            return True
+        return moov > mdat
+    except OSError:
+        return True
+
+
+async def prepare_video_for_telegram(file_path: str) -> str:
+    """Remux video with faststart so Telegram can stream while downloading."""
+    if not _needs_faststart(file_path):
+        return file_path
+
+    logger.info("Applying faststart remux for Telegram streaming: %s", file_path)
+    remuxed = f"{file_path}.stream.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", file_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        remuxed,
+    ]
+    code, _, stderr = await _run_command(*cmd)
+    if code != 0 or not os.path.exists(remuxed) or os.path.getsize(remuxed) == 0:
+        logger.warning("faststart remux failed, using original: %s", stderr[:200])
+        return file_path
+
+    os.remove(file_path)
+    os.rename(remuxed, file_path)
+    return file_path
+
+
+async def get_media_metadata(file_path: str) -> Dict[str, Any]:
+    """Extract width, height, duration for Telegram upload metadata."""
+    metadata = await _get_ffprobe_data(file_path)
+    duration = int(float(metadata.get("format", {}).get("duration", 0) or 0))
+    width = height = 0
+    for stream in metadata.get("streams", []):
+        if stream.get("codec_type") == "video":
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            break
+    return {"width": width, "height": height, "duration": duration}

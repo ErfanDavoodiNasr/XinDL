@@ -8,7 +8,7 @@ URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
 PLATFORM_DOMAINS = {
     "youtube": ("youtube.com", "youtu.be", "music.youtube.com"),
     "instagram": ("instagram.com",),
-    "soundcloud": ("soundcloud.com",),
+    "soundcloud": ("soundcloud.com", "on.soundcloud.com"),
 }
 
 PLATFORM_LABELS = {
@@ -42,8 +42,8 @@ def is_supported_url(url: str) -> bool:
 
 def unsupported_message() -> str:
     return (
-        "❌ <b>پلتفرم پشتیبانی نمی‌شود.</b>\n\n"
-        "فقط این ۳ پلتفرم ساپورت می‌شن:\n"
+        "❌ <b>Platform not supported.</b>\n\n"
+        "Only these platforms are supported:\n"
         "<b>YouTube</b> | <b>Instagram</b> | <b>SoundCloud</b>\n\n"
-        "لینک مستقیم یکی از این‌ها بفرست."
+        "Please send a direct link from one of them."
     )

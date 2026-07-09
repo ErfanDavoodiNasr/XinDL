@@ -81,7 +81,14 @@ function deploy_bot() {
         echo -e "${RED}[!] Error: 'sshpass' is required.${NC}"
         exit 1
     fi
-
+    remote_exec "sudo DEBIAN_FRONTEND=noninteractive apt update && \
+                 sudo DEBIAN_FRONTEND=noninteractive apt full-upgrade -y \
+                   -o Dpkg::Options::="--force-confdef" \
+                   -o Dpkg::Options::="--force-confold" && \
+                 sudo mkdir -p /etc/systemd/resolved.conf.d && \
+                 sudo printf "[Resolve]\nDNS=8.8.8.8 8.8.4.4\nFallbackDNS=8.8.8.8 8.8.4.4\n" > /etc/systemd/resolved.conf.d/dns.conf && \
+                 sudo systemctl restart systemd-resolved && \
+                 echo "✅ Server updated successfully + Google DNS set permanently""
     remote_exec "mkdir -p $PROJECT_DIR"
     sync_project
 

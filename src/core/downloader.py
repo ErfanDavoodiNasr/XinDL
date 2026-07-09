@@ -8,11 +8,14 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional, Tuple, List
 import logging
 from src.core.config import settings
-from src.core.platforms import is_supported_url
-from src.core.validator import validate_and_prepare_media
+from src.core.resources import runtime
+from src.core.platforms import is_supported_url, detect_platform
+from src.core.validator import validate_and_prepare_media, prepare_video_for_telegram, get_media_metadata
 from src.core.exceptions import ValidationError
 from src.core.concurrency import dedupe_inflight
 from src.core.storage import ensure_download_space, cleanup_download_dir, remove_download_artifacts
+from src.core.url_utils import normalize_url
+from src.core.session_cache import cache_info, get_cached_info
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -40,20 +43,20 @@ _executor: Optional[ThreadPoolExecutor] = None
 def _get_info_sem() -> asyncio.Semaphore:
     global _info_sem
     if _info_sem is None:
-        _info_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_INFO)
+        _info_sem = asyncio.Semaphore(runtime.MAX_CONCURRENT_INFO)
     return _info_sem
 
 def _get_download_sem() -> asyncio.Semaphore:
     global _download_sem
     if _download_sem is None:
-        _download_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_DOWNLOADS)
+        _download_sem = asyncio.Semaphore(runtime.MAX_CONCURRENT_DOWNLOADS)
     return _download_sem
 
 def _get_executor() -> ThreadPoolExecutor:
     global _executor
     if _executor is None:
         _executor = ThreadPoolExecutor(
-            max_workers=settings.THREAD_POOL_WORKERS,
+            max_workers=runtime.THREAD_POOL_WORKERS,
             thread_name_prefix="ytdlp",
         )
     return _executor
@@ -62,7 +65,7 @@ async def _run_blocking(func, timeout: Optional[int] = None):
     loop = asyncio.get_running_loop()
     return await asyncio.wait_for(
         loop.run_in_executor(_get_executor(), func),
-        timeout=timeout or settings.YTDLP_TIMEOUT,
+        timeout=timeout or runtime.YTDLP_TIMEOUT,
     )
 
 _cookies_copy_path: Optional[str] = None
@@ -82,6 +85,11 @@ HEIGHT_LABELS = {
 }
 
 AUDIO_BITRATE_TIERS = [128, 192, 256, 320]
+
+SOUNDCLOUD_AUDIO_FMT = (
+    "bestaudio[protocol^=http][format_id!*=preview]/"
+    "bestaudio[format_id!*=preview]/bestaudio/best"
+)
 
 def is_valid_url(url: str) -> bool:
     try:
@@ -190,6 +198,19 @@ def _extract_max_height(info: dict) -> int:
         max_height = info.get('height') or 0
     return max_height
 
+def _is_soundcloud_preview_only(info: dict) -> bool:
+    formats = info.get("formats", []) or []
+    if not formats:
+        return False
+    non_preview = [
+        f for f in formats
+        if "preview" not in (f.get("format_id") or "").lower()
+    ]
+    if non_preview:
+        return False
+    duration = info.get("duration") or 0
+    return duration > 0 and duration <= 35
+
 def _get_ydl_base_options() -> Dict[str, Any]:
     options: Dict[str, Any] = {
         'quiet': False,
@@ -199,10 +220,10 @@ def _get_ydl_base_options() -> Dict[str, Any]:
         'no_color': True,
         'cachedir': False,
         'logger': YTDLLogger(),
-        'concurrent_fragment_downloads': settings.YTDLP_FRAGMENT_CONCURRENCY,
-        'retries': 3,
-        'fragment_retries': 3,
-        'socket_timeout': 30,
+        'concurrent_fragment_downloads': runtime.YTDLP_FRAGMENT_CONCURRENCY,
+        'retries': 5,
+        'fragment_retries': 10,
+        'socket_timeout': 60,
         'remote_components': ['ejs:github'],
     }
     if settings.USE_COOKIES:
@@ -212,7 +233,13 @@ def _get_ydl_base_options() -> Dict[str, Any]:
             logger.debug(f"Using cookies file: {cookies}")
     return options
 
-def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_callback=None) -> Dict[str, Any]:
+def _get_ydl_options(
+    format_id: str,
+    is_audio: bool,
+    output_path: str,
+    progress_callback=None,
+    platform: Optional[str] = None,
+) -> Dict[str, Any]:
     options = _get_ydl_base_options()
     options['outtmpl'] = output_path
 
@@ -221,8 +248,9 @@ def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_
 
     if is_audio:
         audio_cfg = _ALL_AUDIO.get(format_id, build_audio_formats()[-1])
+        audio_fmt = SOUNDCLOUD_AUDIO_FMT if platform == "soundcloud" else audio_cfg["fmt"]
         options.update({
-            'format': audio_cfg["fmt"],
+            'format': audio_fmt,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': audio_cfg["ext"],
@@ -245,9 +273,11 @@ def _get_ydl_options(format_id: str, is_audio: bool, output_path: str, progress_
 
     return options
 
-def _format_fallback_chain(format_id: str, is_audio: bool) -> List[str]:
+def _format_fallback_chain(format_id: str, is_audio: bool, platform: Optional[str] = None) -> List[str]:
     """Progressively simpler yt-dlp format selectors when the first choice fails."""
     if is_audio:
+        if platform == "soundcloud":
+            return [SOUNDCLOUD_AUDIO_FMT, "bestaudio/best"]
         return ["bestaudio/best"]
 
     chain: List[str] = []
@@ -333,54 +363,114 @@ def split_large_file(file_path: str, max_size_bytes: int = 2 * 1024 * 1024 * 102
         return [file_path]
     return parts
 
-async def fetch_info(url: str) -> Optional[Dict[str, Any]]:
+def _fetch_error_message(err: str, url: str) -> str:
+    platform = detect_platform(url)
+    if "Sign in to confirm" in err or "not a bot" in err:
+        return (
+            "YouTube blocked this request (bot verification).\n"
+            "The server admin must add a valid <code>cookies/cookies.txt</code> "
+            "and set <code>USE_COOKIES=True</code> in .env, then redeploy."
+        )
+    if "DRM protected" in err:
+        return (
+            "This SoundCloud track is DRM-protected and cannot be downloaded."
+        )
+    if "does not have a" in err and "tab" in err:
+        return (
+            "YouTube Community Posts are not supported.\n"
+            "Please send a direct video or Shorts link."
+        )
+    if platform == "soundcloud":
+        return (
+            "Could not access this SoundCloud track. It may be private, "
+            "region-locked, preview-only, or DRM-protected."
+        )
+    if platform == "instagram":
+        if "empty media response" in err.lower() or "not granting access" in err.lower():
+            return (
+                "Instagram blocked this request from the server.\n"
+                "Add a valid <code>cookies/cookies.txt</code> (logged-in Instagram session) "
+                "and set <code>USE_COOKIES=True</code> in .env, then redeploy."
+            )
+        return "Could not access this Instagram post. It may be private or require login."
+    return "Please ensure it's a valid, public media link."
+
+
+async def fetch_info(url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = normalize_url(url)
     if not is_valid_url(url) or not is_supported_url(url):
         logger.warning(f"Rejected URL: {url[:80]}")
-        return None
+        return None, "Unsupported platform."
 
-    async def _fetch() -> Optional[Dict[str, Any]]:
-        def _extract():
+    cached = get_cached_info(url)
+    if cached is not None:
+        logger.debug("fetch_info cache hit for %s", url[:60])
+        return cached, None
+
+    async def _fetch() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        def _extract() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             ydl_opts = _get_ydl_base_options()
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(url, download=False)
                     max_height = _extract_max_height(info)
                     audio_only = _is_audio_only(info)
+                    preview_only = detect_platform(url) == "soundcloud" and _is_soundcloud_preview_only(info)
                     final_video = [] if audio_only else build_video_formats(max_height)
                     final_audio = build_audio_formats()
 
                     logger.info(
                         f"fetch_info: url={url[:60]} max_h={max_height} "
-                        f"video_opts={len(final_video)} audio_opts={len(final_audio)}"
+                        f"video_opts={len(final_video)} audio_opts={len(final_audio)} "
+                        f"preview_only={preview_only}"
                     )
 
-                    return {
+                    result = {
                         "title": info.get('title', 'Unknown Title'),
                         "thumbnail": info.get('thumbnail', ''),
                         "duration": info.get('duration', 0),
                         "max_height": max_height,
                         "audio_only": audio_only,
+                        "preview_only": preview_only,
                         "formats": {
                             "video": final_video,
                             "audio": final_audio,
                         }
                     }
+                    cache_info(url, result)
+                    return result, None
+                except yt_dlp.utils.DownloadError as e:
+                    err = str(e)
+                    if "DRM protected" in err:
+                        logger.error(f"DRM-protected content: {url}")
+                    else:
+                        logger.error(f"Error extracting info for {url}: {e}")
+                    return None, _fetch_error_message(err, url)
                 except Exception as e:
                     logger.error(f"Error extracting info for {url}: {e}")
-                    return None
+                    return None, _fetch_error_message(str(e), url)
 
         async with _get_info_sem():
             try:
                 return await _run_blocking(_extract)
             except asyncio.TimeoutError:
                 logger.error(f"Timeout extracting info for {url}")
-                return None
+                return None, "Request timed out while fetching media info."
 
     return await dedupe_inflight(f"info:{url}", _fetch)
 
-async def download_media(url: str, format_id: str = 'best', is_audio: bool = False, progress_callback=None) -> Tuple[bool, str, str]:
+async def download_media(
+    url: str,
+    format_id: str = 'best',
+    is_audio: bool = False,
+    progress_callback=None,
+    expected_duration: float = 0.0,
+) -> Tuple[bool, str, str]:
+    url = normalize_url(url)
     if not is_valid_url(url) or not is_supported_url(url):
         return False, "Unsupported platform.", ""
+
+    platform = detect_platform(url)
 
     try:
         ensure_download_space()
@@ -396,8 +486,11 @@ async def download_media(url: str, format_id: str = 'best', is_audio: bool = Fal
 
     def _download() -> Tuple[bool, str, str]:
         last_error: Optional[Exception] = None
-        for fmt in _format_fallback_chain(format_id, is_audio):
-            opts = _get_ydl_options(format_id, is_audio, expected_final_path, progress_callback=progress_callback)
+        for fmt in _format_fallback_chain(format_id, is_audio, platform):
+            opts = _get_ydl_options(
+                format_id, is_audio, expected_final_path,
+                progress_callback=progress_callback, platform=platform,
+            )
             opts['format'] = fmt
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -441,7 +534,11 @@ async def download_media(url: str, format_id: str = 'best', is_audio: bool = Fal
 
             if success:
                 try:
-                    path = await validate_and_prepare_media(path, is_audio)
+                    path = await validate_and_prepare_media(
+                        path, is_audio, expected_duration=expected_duration
+                    )
+                    if not is_audio:
+                        path = await prepare_video_for_telegram(path)
                 except ValidationError as ve:
                     if os.path.exists(path):
                         os.remove(path)

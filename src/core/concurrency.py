@@ -6,7 +6,7 @@ import time
 from collections import defaultdict, deque
 from typing import Deque, Dict, Optional, Set, TypeVar
 
-from src.core.config import settings
+from src.core.resources import runtime
 
 T = TypeVar("T")
 
@@ -19,14 +19,14 @@ _inflight_info_lock = asyncio.Lock()
 def get_upload_sem() -> asyncio.Semaphore:
     global _upload_sem
     if _upload_sem is None:
-        _upload_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_UPLOADS)
+        _upload_sem = asyncio.Semaphore(runtime.MAX_CONCURRENT_UPLOADS)
     return _upload_sem
 
 
 def get_background_sem() -> asyncio.Semaphore:
     global _background_sem
     if _background_sem is None:
-        _background_sem = asyncio.Semaphore(settings.MAX_BACKGROUND_TASKS)
+        _background_sem = asyncio.Semaphore(runtime.MAX_BACKGROUND_TASKS)
     return _background_sem
 
 
@@ -58,7 +58,7 @@ class UserGate:
             while window and window[0] < cutoff:
                 window.popleft()
 
-            if len(window) >= settings.USER_RATE_LIMIT_PER_MINUTE:
+            if len(window) >= runtime.USER_RATE_LIMIT_PER_MINUTE:
                 return "⏳ <i>Too many requests. Please wait a moment and try again.</i>"
 
             window.append(now)
@@ -70,7 +70,7 @@ class UserGate:
 
         async with self._lock:
             active = self._active_downloads[user_id]
-            if active >= settings.USER_MAX_ACTIVE_DOWNLOADS:
+            if active >= runtime.USER_MAX_ACTIVE_DOWNLOADS:
                 return (
                     "⏳ <i>You already have a download in progress. "
                     "Wait for it to finish or cancel it first.</i>"
